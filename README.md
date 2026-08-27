@@ -16,7 +16,7 @@ Restart Codex after installation. You can then ask: “Deploy this project to Br
 The script can also be run directly:
 
 ```bash
-skills/broz-deploy/scripts/broz-deploy.sh deploy . --domain my-demo
+bash skills/broz-deploy/scripts/broz-deploy.sh deploy . --domain my-demo
 ```
 
 It packages locally, uploads an artifact, creates or reuses one isolated guest service, deploys it, downloads the complete public homepage, verifies HTTP 200 and the exact `X-Mim-Deployment` header, then opens the URL. A single successful run is a measurement, not a 10-second SLA.
