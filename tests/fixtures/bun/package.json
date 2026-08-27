@@ -1,0 +1,1 @@
+{"name":"broz-e2e-bun","version":"1.0.0","private":true,"scripts":{"start":"bun run server.ts"}}

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "broz-e2e-python"
+version = "1.0.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+mimir-service = "broz_e2e:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/broz_e2e"]
