@@ -67,10 +67,19 @@ ensure_guest() {
   TOKEN="$(random_hex)"
   local token_hash body response
   token_hash="$(sha256_text "$TOKEN")"
-  body="$(jq -nc --arg p "$PROJECT_ID" --arg h "$token_hash" '{project_id:$p,token_hash:$h}')"
-  response="$TMP_DIR/guest.json"
-  api_call POST /v1/guest-sessions '' "$body" "$response" >/dev/null
-  umask 077
+	body="$(jq -nc --arg p "$PROJECT_ID" --arg h "$token_hash" '{project_id:$p,token_hash:$h}')"
+	response="$TMP_DIR/guest.json"
+	local attempt code
+	for attempt in 1 2 3 4 5; do
+		code="$(curl --silent --show-error --connect-timeout 5 --max-time 15 --request POST --output "$response" --write-out '%{http_code}' -H 'accept: application/json' -H 'content-type: application/json' --data "$body" "$API_URL/v1/guest-sessions" 2>/dev/null || true)"
+		[ -n "$code" ] || code=000
+		case "$code" in
+			2??) break;;
+			502|503|504|000) [ "$attempt" -eq 5 ] || { sleep "0.$((attempt * 2))"; continue; };;
+		esac
+		die "Membership POST /v1/guest-sessions returned HTTP $code: $(jq -c '{error:(.error // "unknown")}' "$response" 2>/dev/null || printf '%s' unknown)"
+	done
+	umask 077
   jq -nc --arg p "$PROJECT_ID" --arg t "$TOKEN" '{project_id:$p,token:$t}' >"$CRED_FILE.tmp"
   chmod 600 "$CRED_FILE.tmp"; mv "$CRED_FILE.tmp" "$CRED_FILE"
 }
