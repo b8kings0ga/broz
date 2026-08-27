@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, hashlib, json, os
+import argparse, hashlib, io, json, os, tarfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 state = {"services": {}, "deployments": 0}
@@ -16,7 +16,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/guest-sessions":
             body = json.loads(self.body()); self.send_json(201, {"project_id": body["project_id"], "user_id": "guest", "plan": "guest-preview"}); return
         if self.path.startswith("/v1/artifacts"):
-            data = self.body(); digest = hashlib.sha256(data).hexdigest(); self.send_json(201, {"id": "art_"+digest[:8], "digest": "sha256:"+digest, "kind": "mock"}); return
+            data = self.body()
+            try:
+                with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+                    names = [os.path.normpath(item.name) for item in archive.getmembers()]
+                if "." in names or any(name.startswith("../") or name.startswith("/") for name in names): raise ValueError("unsafe archive")
+            except (tarfile.TarError, ValueError): self.send_json(400, {"error": "invalid_artifact"}); return
+            digest = hashlib.sha256(data).hexdigest(); self.send_json(201, {"id": "art_"+digest[:8], "digest": "sha256:"+digest, "kind": "mock"}); return
         if self.path == "/v1/services":
             body = json.loads(self.body()); service = {"id": "svc_test", "name": body["name"], "status": "stopped", "artifact_id": body["artifact_id"], "active_deployment_id": "", "hostname": "127.0.0.1:%d" % self.server.server_port}
             state["services"][service["id"]] = service; self.send_json(201, service); return

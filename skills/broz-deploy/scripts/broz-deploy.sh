@@ -132,8 +132,8 @@ package_artifact() {
       ;;
     *) die "unsupported runtime: $RUNTIME";;
   esac
-  ARTIFACT_FILE="$TMP_DIR/artifact.tar.gz"
-  (cd "$stage" && COPYFILE_DISABLE=1 tar -czf "$ARTIFACT_FILE" .)
+	ARTIFACT_FILE="$TMP_DIR/artifact.tar.gz"
+	(cd "$stage" && find . -mindepth 1 -maxdepth 1 -print | COPYFILE_DISABLE=1 tar -czf "$ARTIFACT_FILE" -T -)
   [ "$(wc -c <"$ARTIFACT_FILE" | tr -d ' ')" -le 8388608 ] || die "guest artifact exceeds 8 MiB"
 }
 write_state() {
