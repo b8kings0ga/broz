@@ -167,10 +167,10 @@ deploy() {
     [ -n "$DOMAIN" ] || DOMAIN="$NAME"
     response="$TMP_DIR/service.json"
     api_call POST /v1/services "$TOKEN" "$(jq -nc --arg n "$NAME" --arg a "$artifact_id" --arg d "$DOMAIN" '{name:$n,artifact_id:$a,subdomain:$d}')" "$response" >/dev/null
-    service_id="$(jq -er '.id' "$response")"; hostname="$(jq -er '.hostname' "$response")"
-    write_state "$service_id" "$hostname"
-  fi
-  CREATE_MS="$(elapsed "$create_start")"
+		service_id="$(jq -er '.id' "$response")"; hostname="$(jq -er '.hostname' "$response")"
+	fi
+	write_state "$service_id" "$hostname"
+	CREATE_MS="$(elapsed "$create_start")"
 
   deploy_start="$(now_ms)"; progress "deploying $service_id"
   response="$TMP_DIR/deploy.json"
