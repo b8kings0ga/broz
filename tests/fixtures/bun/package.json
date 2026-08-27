@@ -1,1 +1,1 @@
-{"name":"broz-e2e-bun","version":"1.0.0","private":true,"scripts":{"start":"bun run server.ts"}}
+{"name":"broz-e2e-bun","version":"1.0.0","private":true,"scripts":{"start":"bun run server.ts"},"dependencies":{"broz-local":"file:./vendor/broz-local"}}

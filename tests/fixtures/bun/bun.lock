@@ -4,7 +4,12 @@
   "workspaces": {
     "": {
       "name": "broz-e2e-bun",
+      "dependencies": {
+        "broz-local": "file:./vendor/broz-local",
+      },
     },
   },
-  "packages": {},
+  "packages": {
+    "broz-local": ["broz-local@file:vendor/broz-local", {}],
+  }
 }
