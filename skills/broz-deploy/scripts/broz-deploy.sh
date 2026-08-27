@@ -51,9 +51,13 @@ api_call() {
 load_project() {
   PROJECT_DIR="$(cd "$1" 2>/dev/null && pwd)" || die "project directory not found: $1"
   STATE_FILE="$PROJECT_DIR/.broz.json"
-  if [ -f "$STATE_FILE" ]; then
-    PROJECT_ID="$(jq -er '.project_id' "$STATE_FILE")" || die "invalid .broz.json"
-  else PROJECT_ID="$(new_uuid)"; fi
+	if [ -f "$STATE_FILE" ]; then
+		PROJECT_ID="$(jq -er '.project_id' "$STATE_FILE")" || die "invalid .broz.json"
+	else
+		PROJECT_ID="$(new_uuid)"
+		jq -nc --arg p "$PROJECT_ID" '{project_id:$p}' >"$STATE_FILE.tmp"
+		mv "$STATE_FILE.tmp" "$STATE_FILE"
+	fi
   CRED_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/broz/credentials"
   CRED_FILE="$CRED_DIR/$PROJECT_ID.json"
 }
