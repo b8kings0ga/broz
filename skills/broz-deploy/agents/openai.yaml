@@ -1,0 +1,4 @@
+interface:
+  display_name: "Broz Deploy"
+  short_description: "Deploy Bun, Python, or Linux binaries to Broz"
+  default_prompt: "Deploy this project to Broz and verify the exact public deployment is ready."
