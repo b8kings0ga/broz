@@ -168,8 +168,13 @@ deploy() {
   ensure_guest
   upload_start="$(now_ms)"; progress "uploading artifact"
   response="$TMP_DIR/artifact.json"
-  code="$(curl --silent --show-error --connect-timeout 5 --max-time 60 --request POST --output "$response" --write-out '%{http_code}' -H "authorization: Bearer $TOKEN" -H 'content-type: application/gzip' --data-binary "@$ARTIFACT_FILE" "$API_URL/v1/artifacts?kind=$RUNTIME&arch=$ARCH")" || die "artifact upload failed"
-  [ "${code#2}" != "$code" ] || die "artifact upload returned HTTP $code: $(jq -c '{error:(.error // "unknown")}' "$response")"
+	local attempt
+	for attempt in 1 2 3 4 5; do
+		code="$(curl --silent --show-error --connect-timeout 5 --max-time 60 --request POST --output "$response" --write-out '%{http_code}' -H "authorization: Bearer $TOKEN" -H 'content-type: application/gzip' --data-binary "@$ARTIFACT_FILE" "$API_URL/v1/artifacts?kind=$RUNTIME&arch=$ARCH" 2>/dev/null || true)"
+		[ -n "$code" ] || code=000
+		case "$code" in 2??) break;; 502|503|504|000) [ "$attempt" -eq 5 ] || { sleep "0.$((attempt * 2))"; continue; };; esac
+		die "artifact upload returned HTTP $code: $(jq -c '{error:(.error // "unknown")}' "$response" 2>/dev/null || printf '%s' unknown)"
+	done
   artifact_id="$(jq -er '.id' "$response")"; artifact_digest="$(jq -er '.digest' "$response")"; UPLOAD_MS="$(elapsed "$upload_start")"
 
   create_start="$(now_ms)"
@@ -188,8 +193,12 @@ deploy() {
   deploy_start="$(now_ms)"; progress "deploying $service_id"
   response="$TMP_DIR/deploy.json"
   local request_id="broz_$(printf '%s' "$PROJECT_ID:$artifact_digest" | tr -cd 'A-Za-z0-9_' | cut -c1-96)"
-  code="$(curl --silent --show-error --connect-timeout 5 --max-time 185 --request POST --output "$response" --write-out '%{http_code}' -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -H "Idempotency-Key: $request_id" --data "$(jq -nc --arg a "$artifact_id" '{artifact_id:$a}')" "$API_URL/v1/services/$service_id/deploy")" || die "deploy request failed"
-  [ "$code" = 200 ] || die "deploy returned HTTP $code: $(jq -c '{error:(.error // "unknown")}' "$response")"
+	for attempt in 1 2 3 4 5; do
+		code="$(curl --silent --show-error --connect-timeout 5 --max-time 185 --request POST --output "$response" --write-out '%{http_code}' -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -H "Idempotency-Key: $request_id" --data "$(jq -nc --arg a "$artifact_id" '{artifact_id:$a}')" "$API_URL/v1/services/$service_id/deploy" 2>/dev/null || true)"
+		[ -n "$code" ] || code=000
+		case "$code" in 200) break;; 502|503|504|000) [ "$attempt" -eq 5 ] || { sleep "0.$((attempt * 2))"; continue; };; esac
+		die "deploy returned HTTP $code: $(jq -c '{error:(.error // "unknown")}' "$response" 2>/dev/null || printf '%s' unknown)"
+	done
   deployment_id="$(jq -er '.id' "$response")"; DEPLOY_MS="$(elapsed "$deploy_start")"
 	public_url="$PUBLIC_SCHEME://$hostname"; ready_start="$(now_ms)"; progress "waiting for exact public homepage"
   wait_page "$public_url" "$deployment_id"; PAGE_READY_MS="$(elapsed "$ready_start")"; TOTAL_MS="$(elapsed "$total_start")"
