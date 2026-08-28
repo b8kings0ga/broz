@@ -192,7 +192,9 @@ deploy() {
 
   deploy_start="$(now_ms)"; progress "deploying $service_id"
   response="$TMP_DIR/deploy.json"
-  local request_id="broz_$(printf '%s' "$PROJECT_ID:$artifact_digest" | tr -cd 'A-Za-z0-9_' | cut -c1-96)"
+	# Keep retries within this command idempotent without making a later rollback
+	# to identical bytes reuse an old, no-longer-active deployment.
+	local request_id="broz_$(printf '%s' "$PROJECT_ID:$artifact_digest" | tr -cd 'A-Za-z0-9_' | cut -c1-88)_$(random_hex | cut -c1-16)"
 	for attempt in 1 2 3 4 5; do
 		code="$(curl --silent --show-error --connect-timeout 5 --max-time 185 --request POST --output "$response" --write-out '%{http_code}' -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -H "Idempotency-Key: $request_id" --data "$(jq -nc --arg a "$artifact_id" '{artifact_id:$a}')" "$API_URL/v1/services/$service_id/deploy" 2>/dev/null || true)"
 		[ -n "$code" ] || code=000
