@@ -154,7 +154,7 @@ wait_page() {
   local url="$1" deployment="$2" deadline=$(( $(now_ms) + 120000 )) code header
   while [ "$(now_ms)" -lt "$deadline" ]; do
     code="$(curl --silent --show-error --location --connect-timeout 2 --max-time 5 --dump-header "$TMP_DIR/page.headers" --output "$TMP_DIR/page.body" --write-out '%{http_code}' "$url/" 2>/dev/null || true)"
-    header="$(awk 'BEGIN{IGNORECASE=1} /^X-Mim-Deployment:/{gsub("\r",""); sub(/^[^:]*:[[:space:]]*/,""); v=$0} END{print v}' "$TMP_DIR/page.headers" 2>/dev/null || true)"
+    header="$(awk 'tolower($0) ~ /^x-mim-deployment:/{gsub("\r",""); sub(/^[^:]*:[[:space:]]*/,""); v=$0} END{print v}' "$TMP_DIR/page.headers" 2>/dev/null || true)"
     if [ "$code" = 200 ] && [ "$header" = "$deployment" ] && ! grep -qi 'service warming up' "$TMP_DIR/page.body"; then return 0; fi
     sleep 0.1
   done

@@ -38,7 +38,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             dep = state["services"].get("svc_test", {}).get("active_deployment_id", "")
             data = b"<!doctype html><title>Broz mock</title>"
-            self.send_response(200); self.send_header("X-Mim-Deployment", dep); self.send_header("content-length", str(len(data))); self.end_headers(); self.wfile.write(data); return
+            # HTTP/2 gateways commonly normalize field names to lowercase. Keep
+            # the mock that way so macOS/BSD awk compatibility is exercised.
+            self.send_response(200); self.send_header("x-mim-deployment", dep); self.send_header("content-length", str(len(data))); self.end_headers(); self.wfile.write(data); return
         self.send_json(404, {"error": "not_found"})
     def do_DELETE(self):
         if self.path == "/v1/services/svc_test": state["services"].pop("svc_test", None); self.send_response(204); self.end_headers(); return
