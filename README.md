@@ -19,7 +19,7 @@ The script can also be run directly:
 bash skills/broz-deploy/scripts/broz-deploy.sh deploy . --domain my-demo
 ```
 
-It packages locally, uploads an artifact, creates or reuses one isolated guest service, deploys it, downloads the complete public homepage, verifies HTTP 200 and the exact `X-Mim-Deployment` header, then opens the URL. A single successful run is a measurement, not a 10-second SLA.
+It packages locally, uploads an artifact, creates or reuses one isolated guest service, begins watching the public URL concurrently with the Deploy request, downloads the complete homepage, verifies HTTP 200 and the exact `X-Mim-Deployment` header, then opens the URL. The JSON reports `upload_to_ready_ms` and `deploy_to_ready_ms`; `within_10s` is based on upload-to-ready time. A single successful run is a measurement, not a 10-second SLA.
 
 See [runtime contracts](skills/broz-deploy/references/runtime-contracts.md) for the accepted project layouts.
 

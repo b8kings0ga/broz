@@ -11,8 +11,8 @@ For deployment:
 
 1. Read `references/runtime-contracts.md` for the selected runtime.
 2. Run `bash scripts/broz-deploy.sh deploy PATH` with `--domain NAME` when the user requests a hostname. Runtime auto-detection is preferred.
-3. Report the final JSON and public URL. Success means the complete homepage returned HTTP 200 and `X-Mim-Deployment` exactly matched this deployment.
-4. Do not claim a 10-second SLA. You may state whether this measured run was within 10 seconds.
+3. Report the final JSON and public URL. Success means the complete homepage returned HTTP 200 and `X-Mim-Deployment` exactly matched this deployment. Use `timings.upload_to_ready_ms` for the upload-to-public measurement; service creation is included on a first deployment and omitted when the project reuses its service.
+4. Do not claim a 10-second SLA. You may state whether this measured run was within 10 seconds, and must preserve/report slower attempts when evaluating reliability.
 
 For `status` and `stop`, run `bash scripts/broz-deploy.sh` with the corresponding command against the project path. `stop` is reversible.
 

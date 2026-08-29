@@ -9,6 +9,9 @@ ARCH=amd64
 NAME=""
 DOMAIN=""
 BINARY_FILE=""
+PAGE_PID=""
+STATE_CREATED=0
+TMP_DIR=""
 
 die() { printf 'broz: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
@@ -57,6 +60,7 @@ load_project() {
 		PROJECT_ID="$(new_uuid)"
 		jq -nc --arg p "$PROJECT_ID" '{project_id:$p}' >"$STATE_FILE.tmp"
 		mv "$STATE_FILE.tmp" "$STATE_FILE"
+		STATE_CREATED=1
 	fi
   CRED_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/broz/credentials"
   CRED_FILE="$CRED_DIR/$PROJECT_ID.json"
@@ -137,7 +141,11 @@ package_artifact() {
     *) die "unsupported runtime: $RUNTIME";;
   esac
 	ARTIFACT_FILE="$TMP_DIR/artifact.tar.gz"
-	(cd "$stage" && find . -mindepth 1 -maxdepth 1 -print | COPYFILE_DISABLE=1 tar -czf "$ARTIFACT_FILE" -T -)
+	# Normalize archive metadata so unchanged source produces the same digest.
+	# This lets Membership reuse its content-addressed artifact without skipping
+	# the required upload step.
+	find "$stage" -exec touch -t 198001010000 {} +
+	(cd "$stage" && find . -type f -print | LC_ALL=C sort | COPYFILE_DISABLE=1 tar --format=ustar --uid 0 --gid 0 --numeric-owner -cf - -T - | gzip -n >"$ARTIFACT_FILE")
   [ "$(wc -c <"$ARTIFACT_FILE" | tr -d ' ')" -le 8388608 ] || die "guest artifact exceeds 8 MiB"
 }
 write_state() {
@@ -151,18 +159,22 @@ open_url() {
   elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$1" >/dev/null 2>&1 & fi
 }
 wait_page() {
-  local url="$1" deployment="$2" deadline=$(( $(now_ms) + 120000 )) code header
-  while [ "$(now_ms)" -lt "$deadline" ]; do
-    code="$(curl --silent --show-error --location --connect-timeout 2 --max-time 5 --dump-header "$TMP_DIR/page.headers" --output "$TMP_DIR/page.body" --write-out '%{http_code}' "$url/" 2>/dev/null || true)"
-    header="$(awk 'tolower($0) ~ /^x-mim-deployment:/{gsub("\r",""); sub(/^[^:]*:[[:space:]]*/,""); v=$0} END{print v}' "$TMP_DIR/page.headers" 2>/dev/null || true)"
-    if [ "$code" = 200 ] && [ "$header" = "$deployment" ] && ! grep -qi 'service warming up' "$TMP_DIR/page.body"; then return 0; fi
-    sleep 0.1
-  done
-  die "public page did not become ready (HTTP ${code:-none}, deployment header ${header:-missing})"
+	local url="$1" deployment_file="$2" code="none" header="missing" deployment="" started
+	started="$(now_ms)"
+	while [ "$(elapsed "$started")" -lt 120000 ]; do
+		code="$(curl --silent --show-error --location --connect-timeout 2 --max-time 8 --dump-header "$TMP_DIR/page.headers" --output "$TMP_DIR/page.body" --write-out '%{http_code}' "$url/" 2>/dev/null || true)"
+		header="$(awk 'BEGIN{IGNORECASE=1}/^x-mim-deployment:/{sub(/^[^:]*:[[:space:]]*/,"");gsub("\r","");value=$0}END{print value}' "$TMP_DIR/page.headers" 2>/dev/null)"
+		# curl writes the status only after the complete homepage body is stored.
+		if [ -s "$deployment_file" ]; then
+			deployment="$(cat "$deployment_file")"
+			if [ "$code" = 200 ] && [ "$header" = "$deployment" ]; then return 0; fi
+		fi
+	done
+	die "public page did not become ready (HTTP ${code:-none}, deployment header ${header:-missing})"
 }
 
 deploy() {
-  local package_start upload_start create_start deploy_start ready_start total_start response upload code artifact_id artifact_digest service_id hostname deployment_id public_url
+  local package_start upload_start create_start deploy_start ready_start total_start response upload code artifact_id artifact_digest service_id hostname deployment_id public_url server_timing upload_to_ready_ms deploy_to_ready_ms post_deploy_verify_ms
   total_start="$(now_ms)"; package_start="$total_start"
   detect_runtime; progress "packaging $RUNTIME artifact"; package_artifact; PACKAGE_MS="$(elapsed "$package_start")"
   ensure_guest
@@ -190,22 +202,33 @@ deploy() {
 	write_state "$service_id" "$hostname"
 	CREATE_MS="$(elapsed "$create_start")"
 
-  deploy_start="$(now_ms)"; progress "deploying $service_id"
+	public_url="$PUBLIC_SCHEME://$hostname"
+	deploy_start="$(now_ms)"; progress "deploying $service_id"
+	wait_page "$public_url" "$TMP_DIR/expected-deployment" &
+	PAGE_PID=$!
   response="$TMP_DIR/deploy.json"
 	# Keep retries within this command idempotent without making a later rollback
 	# to identical bytes reuse an old, no-longer-active deployment.
 	local request_id="broz_$(printf '%s' "$PROJECT_ID:$artifact_digest" | tr -cd 'A-Za-z0-9_' | cut -c1-88)_$(random_hex | cut -c1-16)"
 	for attempt in 1 2 3 4 5; do
-		code="$(curl --silent --show-error --connect-timeout 5 --max-time 185 --request POST --output "$response" --write-out '%{http_code}' -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -H "Idempotency-Key: $request_id" --data "$(jq -nc --arg a "$artifact_id" '{artifact_id:$a}')" "$API_URL/v1/services/$service_id/deploy" 2>/dev/null || true)"
+		code="$(curl --silent --show-error --connect-timeout 5 --max-time 185 --request POST --dump-header "$TMP_DIR/deploy.headers" --output "$response" --write-out '%{http_code}' -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -H "Idempotency-Key: $request_id" --data "$(jq -nc --arg a "$artifact_id" '{artifact_id:$a}')" "$API_URL/v1/services/$service_id/deploy" 2>/dev/null || true)"
 		[ -n "$code" ] || code=000
 		case "$code" in 200) break;; 502|503|504|000) [ "$attempt" -eq 5 ] || { sleep "0.$((attempt * 2))"; continue; };; esac
+		kill "$PAGE_PID" 2>/dev/null || true; wait "$PAGE_PID" 2>/dev/null || true; PAGE_PID=""
 		die "deploy returned HTTP $code: $(jq -c '{error:(.error // "unknown")}' "$response" 2>/dev/null || printf '%s' unknown)"
 	done
   deployment_id="$(jq -er '.id' "$response")"; DEPLOY_MS="$(elapsed "$deploy_start")"
-	public_url="$PUBLIC_SCHEME://$hostname"; ready_start="$(now_ms)"; progress "waiting for exact public homepage"
-  wait_page "$public_url" "$deployment_id"; PAGE_READY_MS="$(elapsed "$ready_start")"; TOTAL_MS="$(elapsed "$total_start")"
+	printf '%s\n' "$deployment_id" >"$TMP_DIR/expected-deployment"
+	server_timing="$(awk 'BEGIN{IGNORECASE=1}/^server-timing:/{sub(/^[^:]*:[[:space:]]*/,"");gsub("\r","");value=$0}END{print value}' "$TMP_DIR/deploy.headers")"
+	ready_start="$(now_ms)"; progress "waiting for exact public homepage"
+	if ! wait "$PAGE_PID"; then PAGE_PID=""; die "public page readiness check failed"; fi
+	PAGE_PID=""
+	post_deploy_verify_ms="$(elapsed "$ready_start")"
+	deploy_to_ready_ms="$(elapsed "$deploy_start")"
+	upload_to_ready_ms="$(elapsed "$upload_start")"
+	PAGE_READY_MS="$deploy_to_ready_ms"; TOTAL_MS="$(elapsed "$total_start")"
   open_url "$public_url"
-  jq -nc --arg artifact_id "$artifact_id" --arg service_id "$service_id" --arg deployment_id "$deployment_id" --arg public_url "$public_url" --argjson package_ms "$PACKAGE_MS" --argjson upload_ms "$UPLOAD_MS" --argjson create_ms "$CREATE_MS" --argjson deploy_ms "$DEPLOY_MS" --argjson page_ready_ms "$PAGE_READY_MS" --argjson total_ms "$TOTAL_MS" '{ok:true,artifact_id:$artifact_id,service_id:$service_id,deployment_id:$deployment_id,public_url:$public_url,timings:{package_ms:$package_ms,upload_ms:$upload_ms,create_ms:$create_ms,deploy_ms:$deploy_ms,page_ready_ms:$page_ready_ms,total_ms:$total_ms,within_10s:($total_ms<10000)}}'
+  jq -nc --arg artifact_id "$artifact_id" --arg service_id "$service_id" --arg deployment_id "$deployment_id" --arg public_url "$public_url" --arg server_timing "$server_timing" --argjson package_ms "$PACKAGE_MS" --argjson upload_ms "$UPLOAD_MS" --argjson create_ms "$CREATE_MS" --argjson deploy_ms "$DEPLOY_MS" --argjson post_deploy_verify_ms "$post_deploy_verify_ms" --argjson deploy_to_ready_ms "$deploy_to_ready_ms" --argjson upload_to_ready_ms "$upload_to_ready_ms" --argjson total_ms "$TOTAL_MS" '{ok:true,artifact_id:$artifact_id,service_id:$service_id,deployment_id:$deployment_id,public_url:$public_url,server_timing:$server_timing,timings:{package_ms:$package_ms,upload_ms:$upload_ms,create_ms:$create_ms,deploy_ms:$deploy_ms,post_deploy_verify_ms:$post_deploy_verify_ms,deploy_to_ready_ms:$deploy_to_ready_ms,upload_to_ready_ms:$upload_to_ready_ms,total_ms:$total_ms,within_10s:($upload_to_ready_ms<10000)}}'
 }
 
 project_action() {
@@ -222,7 +245,7 @@ project_action() {
   esac
 }
 
-need curl; need jq; need tar; need perl; need od; need file
+need curl; need jq; need tar; need gzip; need perl; need od; need file
 [ "$#" -ge 2 ] || usage
 COMMAND="$1"; shift; PROJECT_PATH="$1"; shift
 YES=0
@@ -236,8 +259,13 @@ while [ "$#" -gt 0 ]; do
     --open) OPEN_BROWSER=1; shift;; --no-open) OPEN_BROWSER=0; shift;; --yes) YES=1; shift;; *) usage;;
   esac
 done
+cleanup() {
+	[ -z "$PAGE_PID" ] || { kill "$PAGE_PID" 2>/dev/null || true; wait "$PAGE_PID" 2>/dev/null || true; }
+	if [ "$STATE_CREATED" -eq 1 ] && [ -n "${STATE_FILE:-}" ] && [ -n "${CRED_FILE:-}" ] && [ ! -f "$CRED_FILE" ]; then rm -f "$STATE_FILE"; fi
+	[ -z "$TMP_DIR" ] || rm -rf "$TMP_DIR"
+}
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/broz.XXXXXX")"; trap cleanup EXIT INT TERM
 load_project "$PROJECT_PATH"
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/broz.XXXXXX")"; trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
 case "$COMMAND" in
   deploy) deploy;;
   status|stop) project_action "$COMMAND";;

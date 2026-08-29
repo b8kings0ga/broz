@@ -14,7 +14,7 @@ for _ in $(seq 1 100); do [ -s "$TMP/port" ] && break; sleep .02; done
 PORT="$(cat "$TMP/port")"
 export HOME="$TMP/home" BROZ_API_URL="http://127.0.0.1:$PORT" BROZ_PUBLIC_SCHEME=http
 result="$($SCRIPT deploy "$TMP/project" --domain mock-demo --no-open)"
-jq -e '.ok and .service_id=="svc_test" and (.timings.total_ms >= 0)' <<<"$result" >/dev/null
+jq -e '.ok and .service_id=="svc_test" and (.timings.total_ms >= 0) and (.timings.upload_to_ready_ms >= .timings.upload_ms) and (.timings.deploy_to_ready_ms >= .timings.deploy_ms) and (.timings.within_10s == (.timings.upload_to_ready_ms < 10000))' <<<"$result" >/dev/null
 [ "$(stat -f '%Lp' "$TMP/home/.config/broz/credentials/"*.json 2>/dev/null || stat -c '%a' "$TMP/home/.config/broz/credentials/"*.json)" = 600 ]
 ! tar -tzf "$TMP"/nonexistent 2>/dev/null || exit 1
 $SCRIPT status "$TMP/project" | jq -e '.service.id=="svc_test"' >/dev/null
