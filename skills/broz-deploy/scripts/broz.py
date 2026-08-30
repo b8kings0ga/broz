@@ -714,7 +714,7 @@ def ensure_activation_ticket(project: Project, cache: dict, force: bool = False)
         # Rolling upgrades and older public Membership installations retain the
         # existing central activation path. A missing optimization endpoint is
         # never allowed to make deployment unavailable.
-        if exc.status == 404 or exc.code == "node_direct_unavailable":
+        if exc.status == 404 or exc.code in {"node_direct_unavailable", "membership_runtime_unavailable", "fast_deploy_unavailable"}:
             return cache
         raise
     expected = fast_deployment_id(project.user_id, service_id, revision_id, request_id)

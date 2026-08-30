@@ -131,5 +131,16 @@ class ConnectionWarmupTests(unittest.TestCase):
         self.assertEqual(calls, [("GET", "/healthz", 6), ("GET", "/healthz", 6)])
 
 
+class ActivationTicketFallbackTests(unittest.TestCase):
+    def test_transient_ticket_failure_keeps_prepared_central_path(self):
+        class UnavailableAPI:
+            def request(self, *_args, **_kwargs):
+                raise broz.BrozError("warming", status=503, code="membership_runtime_unavailable")
+
+        project = type("Project", (), {"api": UnavailableAPI(), "user_id": "user", "state": {}})()
+        cache = {"service_id": "svc", "revision_id": "rev", "prepared_receipt": "receipt"}
+        self.assertEqual(broz.ensure_activation_ticket(project, cache, force=True), cache)
+
+
 if __name__ == "__main__":
     unittest.main()
