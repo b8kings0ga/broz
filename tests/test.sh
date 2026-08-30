@@ -51,6 +51,11 @@ for _ in $(seq 1 100); do
 done
 worker_hot="$($SCRIPT deploy "$TMP/hot-project" --profile mock --no-open)"
 jq -e '.ok and (.worker | startswith("persistent")) and (.timings.command_total_ms >= .timings.total_ms)' <<<"$worker_hot" >/dev/null
+kill -TERM "$WATCH_PID"
+for _ in $(seq 1 100); do kill -0 "$WATCH_PID" 2>/dev/null || break; sleep .02; done
+[ -S "$socket_path" ]
+stale_socket_hot="$($SCRIPT deploy "$TMP/hot-project" --profile mock --no-open)"
+jq -e '.ok and .worker=="direct_fallback"' <<<"$stale_socket_hot" >/dev/null
 $SCRIPT status "$TMP/hot-project" --profile mock | jq -e '.service.id=="svc_test"' >/dev/null
 if $SCRIPT delete "$TMP/hot-project" --profile mock >/dev/null 2>&1; then echo "profile delete succeeded without --yes" >&2; exit 1; fi
 $SCRIPT delete "$TMP/hot-project" --profile mock --yes | jq -e '.status=="deleted"' >/dev/null

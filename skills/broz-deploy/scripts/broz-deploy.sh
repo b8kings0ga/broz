@@ -29,8 +29,19 @@ if [ "${BROZ_FORCE_LEGACY:-0}" != 1 ] && [ "${1:-}" = deploy ] && [ "$#" -ge 2 ]
 		fi
 		if [ "$fast_mode" = 600 ]; then
 			fast_started="$(perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'printf "%.0f",clock_gettime(CLOCK_MONOTONIC)*1000')"
-			fast_response="$(perl -MIO::Socket::UNIX -MSocket -MJSON::PP -e '$SIG{ALRM}=sub{die "timeout\n"}; alarm 190; my $s=IO::Socket::UNIX->new(Type=>SOCK_STREAM,Peer=>$ARGV[0]) or die "connect\n"; print $s encode_json({command=>"deploy",fallback=>$ARGV[1]}),"\n"; shutdown($s,1); local $/; print <$s>; alarm 0' "$fast_socket" "$fast_fallback")" || { printf 'broz: prepared worker response is uncertain; inspect status before retrying\n' >&2; exit 1; }
-			if jq -e '.ok == true' >/dev/null 2>&1 <<<"$fast_response"; then
+			set +e
+			fast_response="$(perl -MIO::Socket::UNIX -MSocket -MJSON::PP -e 'my $s=IO::Socket::UNIX->new(Type=>SOCK_STREAM,Peer=>$ARGV[0]) or exit 42; $SIG{ALRM}=sub{die "timeout\n"}; alarm 190; print $s encode_json({command=>"deploy",fallback=>$ARGV[1]}),"\n"; shutdown($s,1); local $/; print <$s>; alarm 0' "$fast_socket" "$fast_fallback")"
+			fast_status=$?
+			set -e
+			if [ "$fast_status" -eq 42 ]; then
+				# The connect failed before any activation bytes were sent. The
+				# portable helper can safely inspect/freeze/prepare the revision.
+				fast_socket=""
+			elif [ "$fast_status" -ne 0 ]; then
+				printf 'broz: prepared worker response is uncertain; inspect status before retrying\n' >&2
+				exit 1
+			fi
+			if [ -n "$fast_socket" ] && jq -e '.ok == true' >/dev/null 2>&1 <<<"$fast_response"; then
 				fast_finished="$(perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'printf "%.0f",clock_gettime(CLOCK_MONOTONIC)*1000')"
 				fast_response="$(jq -c --argjson ms "$((fast_finished-fast_started))" '.worker="persistent_socket" | .timings.command_total_ms=$ms | .timings.within_1s=($ms<1000)' <<<"$fast_response")"
 				if [ "$fast_open" -eq 1 ]; then
@@ -40,8 +51,10 @@ if [ "${BROZ_FORCE_LEGACY:-0}" != 1 ] && [ "${1:-}" = deploy ] && [ "$#" -ge 2 ]
 				printf '%s\n' "$fast_response"
 				exit 0
 			fi
-			printf 'broz: %s\n' "$(jq -r '.error // "prepared worker failed"' <<<"$fast_response")" >&2
-			exit 1
+			if [ -n "$fast_socket" ]; then
+				printf 'broz: %s\n' "$(jq -r '.error // "prepared worker failed"' <<<"$fast_response")" >&2
+				exit 1
+			fi
 		fi
 	fi
 fi
