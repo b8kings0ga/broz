@@ -761,7 +761,12 @@ def warm_public_connections(project: Project) -> None:
 def warm_membership_connections(project: Project) -> None:
     def warm(api: API) -> None:
         with contextlib.suppress(BrozError):
-            api.request("GET", "/readyz", timeout=6)
+            # /readyz deliberately probes artifact, QLite, Nomad and route
+            # reconciliation. It can take seconds or return 503 during
+            # unrelated recovery, and is therefore the wrong operation for a
+            # transport-only keepalive. /healthz is cheap, authenticated only
+            # by the same edge/TLS path, and does not weaken activate checks.
+            api.request("GET", "/healthz", timeout=6)
 
     lanes = [threading.Thread(target=warm, args=(api,), name=f"broz-api-warm-{lane}", daemon=True)
              for lane, api in enumerate((project.api, project.activation_api))]

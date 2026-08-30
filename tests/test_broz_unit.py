@@ -117,5 +117,19 @@ class PrepareRetryTests(unittest.TestCase):
         self.assertTrue(all(error.stage == "upload" for error in failures))
 
 
+class ConnectionWarmupTests(unittest.TestCase):
+    def test_membership_warmup_uses_liveness_not_readiness(self):
+        calls = []
+
+        class WarmAPI:
+            def request(self, method, path, timeout):
+                calls.append((method, path, timeout))
+                return {}, 200, {}
+
+        project = type("Project", (), {"api": WarmAPI(), "activation_api": WarmAPI()})()
+        broz.warm_membership_connections(project)
+        self.assertEqual(calls, [("GET", "/healthz", 6), ("GET", "/healthz", 6)])
+
+
 if __name__ == "__main__":
     unittest.main()
