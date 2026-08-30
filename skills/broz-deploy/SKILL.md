@@ -16,6 +16,8 @@ For deployment:
 5. Report the final JSON and public URL. Success means the complete homepage returned HTTP 200 and `X-Mim-Deployment` exactly matched this deployment. Report `hot`, `cold`, or `cold_fallback` and preserve all residual preparation in `command_total_ms`.
 6. Do not claim a 1-second or 10-second SLA. You may report measured percentiles only with sample count and prepared/cold conditions, and must preserve slower attempts when evaluating reliability.
 
+If the host has an active system VPN and the user explicitly wants a physical-network benchmark, discover the intended interface and pass `--direct-interface INTERFACE` to both `prepare --watch` and later commands. Do not silently bypass a VPN for ordinary deployments.
+
 For `status` and `stop`, run `bash scripts/broz-deploy.sh` with the corresponding command against the project path. `stop` is reversible.
 
 Deletion is destructive. Obtain explicit confirmation immediately before running `bash scripts/broz-deploy.sh delete PATH --yes`. Never add `--yes` without that confirmation. Successful deletion shuts down the exact project worker, removes project/cache state, and removes only a project-scoped guest credential; named account profiles remain.

@@ -28,7 +28,7 @@ $SCRIPT delete "$TMP/project" --yes | jq -e '.status=="deleted"' >/dev/null
 
 mkdir -p "$TMP/home/.config/broz/profiles" "$TMP/hot-project"
 chmod 700 "$TMP/home/.config/broz/profiles"
-jq -nc --arg api "http://127.0.0.1:$PORT" --arg token mock-token '{api:$api,token:$token}' >"$TMP/home/.config/broz/profiles/mock.json"
+jq -nc --arg api "http://127.0.0.1:$PORT" --arg token mock-token '{api:$api,token:$token,user_id:"mock-user"}' >"$TMP/home/.config/broz/profiles/mock.json"
 chmod 600 "$TMP/home/.config/broz/profiles/mock.json"
 printf '{"scripts":{"start":"bun run server.js"}}\n' >"$TMP/hot-project/package.json"
 printf 'lockfileVersion = 1\n' >"$TMP/hot-project/bun.lock"
@@ -59,9 +59,32 @@ if kill -0 "$WATCH_PID" 2>/dev/null; then echo "delete left prepare worker runni
 [ -f "$TMP/home/.config/broz/profiles/mock.json" ]
 WATCH_PID=""
 
+mkdir -p "$TMP/watch-first-project"
+printf '{"scripts":{"start":"bun run server.js"}}\n' >"$TMP/watch-first-project/package.json"
+printf 'lockfileVersion = 1\n' >"$TMP/watch-first-project/bun.lock"
+printf 'Bun.serve({port:Number(process.env.PORT)})\n' >"$TMP/watch-first-project/server.js"
+watch_first="$($SCRIPT prepare "$TMP/watch-first-project" --profile mock --domain mock-watch-first --watch --no-open)"
+WATCH_PID="$(jq -er '.pid' <<<"$watch_first")"
+watch_project_id="$(jq -er '.project_id' "$TMP/watch-first-project/.broz.json")"
+watch_meta="$TMP/home/.cache/broz/workers/$watch_project_id.json"
+for _ in $(seq 1 100); do [ -f "$watch_meta" ] && break; sleep .02; done
+[ "$(jq -er '.project_id' "$watch_meta")" = "$watch_project_id" ]
+watch_socket="$(jq -er '.socket_path' "$watch_meta")"
+[ -S "$watch_socket" ]
+for _ in $(seq 1 250); do
+  jq -e '.service_id and .hostname' "$TMP/watch-first-project/.broz.json" >/dev/null 2>&1 && break
+  sleep .02
+done
+jq -e '.service_id and .hostname' "$TMP/watch-first-project/.broz.json" >/dev/null
+$SCRIPT delete "$TMP/watch-first-project" --profile mock --yes | jq -e '.status=="deleted"' >/dev/null
+for _ in $(seq 1 100); do kill -0 "$WATCH_PID" 2>/dev/null || break; sleep .02; done
+if kill -0 "$WATCH_PID" 2>/dev/null; then echo "first-start delete left prepare worker running" >&2; exit 1; fi
+WATCH_PID=""
+
 mkdir -p "$TMP/key-project"
 printf '{"scripts":{"start":"bun run index.js"}}\n' >"$TMP/key-project/package.json"
 printf 'lockfileVersion = 1\n' >"$TMP/key-project/bun.lock"
 printf test >"$TMP/key-project/private.pem"
 if $SCRIPT deploy "$TMP/key-project" --no-open >/dev/null 2>&1; then echo "private key was accepted" >&2; exit 1; fi
+python3 "$ROOT/tests/test_broz_unit.py"
 echo "broz mock tests passed"

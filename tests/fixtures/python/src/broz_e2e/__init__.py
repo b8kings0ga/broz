@@ -3,6 +3,7 @@ import os
 import signal
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 SERVICE_ID = os.environ.get("MIM_SERVICE_ID", "local")
 DEPLOYMENT_ID = os.environ.get("MIM_DEPLOYMENT_ID", "local")
@@ -10,10 +11,11 @@ DEPLOYMENT_ID = os.environ.get("MIM_DEPLOYMENT_ID", "local")
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
     def do_GET(self):
-        if self.path == "/":
+        path = urlsplit(self.path).path
+        if path == "/":
             body = f"<!doctype html><title>Broz Python</title><h1>Broz Python is live</h1><p>{SERVICE_ID}</p><p>{DEPLOYMENT_ID}</p>".encode()
             self.send_response(200); self.send_header("content-type", "text/html; charset=utf-8")
-        elif self.path in ("/healthz", "/api/status"):
+        elif path in ("/healthz", "/api/status"):
             body = json.dumps({"ok": True, "service_id": SERVICE_ID, "deployment_id": DEPLOYMENT_ID, "runtime": "python"}).encode()
             self.send_response(200); self.send_header("content-type", "application/json")
         else:

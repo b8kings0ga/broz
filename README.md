@@ -27,6 +27,12 @@ bash skills/broz-deploy/scripts/broz-deploy.sh prepare . --profile PROFILE --wat
 bash skills/broz-deploy/scripts/broz-deploy.sh deploy . --profile PROFILE
 ```
 
+On a development machine whose system VPN routes Broz traffic through a
+distant exit, `prepare` also accepts `--direct-interface INTERFACE`. The worker
+binds Membership and public verification traffic to that interface and records
+the choice only in its private process state; use it only when bypassing the VPN
+is intentional.
+
 The watcher uses latest-wins revisions and prepares the exact source manifest,
 dependency layer, node CAS, persistent slot, route and public connections ahead
 of `deploy`. Bun and Python upload deterministic file manifests; an amd64 Linux
@@ -43,6 +49,11 @@ sample is a measurement under prepared conditions, not an SLA. The JSON reports
 `mode`, preparation/activation stage timings, `command_total_ms`, and
 `within_1s`. The older guest path continues to report its upload/deploy timings
 and `within_10s`.
+
+The prepared worker keeps several public connections warm but reserves fresh
+fallback lanes, and only sends a second idempotent activation request when the
+primary edge path has not exposed the deployment identity within its hedge
+budget. These are latency-tail controls, not weaker readiness rules.
 
 See [runtime contracts](skills/broz-deploy/references/runtime-contracts.md) for the accepted project layouts.
 

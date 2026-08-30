@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-import argparse, hashlib, io, json, os, tarfile
+import argparse, base64, hashlib, io, json, os, tarfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-state = {"services": {}, "deployments": 0, "revisions": 0, "blobs": {}}
+state = {"services": {}, "deployments": 0, "revisions": 0, "blobs": {}, "activation_mismatch_once": True}
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
@@ -34,9 +34,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.endswith("/prepare"):
             self.body(); revision = self.path.split("/")[-2]; self.send_json(200, {"revision_id": revision, "state": "prepared", "prepared_receipt": "receipt_"+revision, "prepared_at": "2026-08-30T00:00:00Z", "metrics_ms": {"cas_materialize": 1}}); return
         if self.path.endswith("/activate"):
-            self.body(); state["deployments"] += 1; deployment = "dep_%d" % state["deployments"]
-            service = state["services"]["svc_test"]; service.update(status="running", active_deployment_id=deployment)
+            self.body()
+            if state["activation_mismatch_once"]:
+                state["activation_mismatch_once"] = False
+                self.send_json(409, {"error": "prepared_receipt_mismatch"}); return
             revision = self.path.split("/")[-2]
+            request_id = self.headers.get("Idempotency-Key", "")
+            identity = "\0".join(("mock-user", "svc_test", revision, request_id)).encode()
+            deployment = "dep_" + base64.urlsafe_b64encode(hashlib.sha256(identity).digest()[:18]).decode().rstrip("=")
+            state["deployments"] += 1
+            service = state["services"]["svc_test"]; service.update(status="running", active_deployment_id=deployment)
             self.send_json(200, {"status": "accessible", "mode": "hot", "service_id": "svc_test", "revision_id": revision, "deployment_id": deployment, "public_url": "http://"+service["hostname"], "metrics_ms": {"child_spawn": 2}}); return
         if self.path.endswith("/deploy"):
             self.body(); state["deployments"] += 1; deployment = "dep_%d" % state["deployments"]

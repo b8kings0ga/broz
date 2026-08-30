@@ -12,7 +12,13 @@ if [ "${BROZ_FORCE_LEGACY:-0}" != 1 ] && [ "${1:-}" = deploy ] && [ "$#" -ge 2 ]
 	fast_project="$(cd "$2" 2>/dev/null && pwd || true)"
 	fast_state="$fast_project/.broz.json"
 	fast_open=1
-	for fast_argument in "$@"; do [ "$fast_argument" != --no-open ] || fast_open=0; done
+	fast_fallback=cold
+	fast_previous=""
+	for fast_argument in "$@"; do
+		[ "$fast_argument" != --no-open ] || fast_open=0
+		if [ "$fast_previous" = --fallback ]; then fast_fallback="$fast_argument"; fi
+		fast_previous="$fast_argument"
+	done
 	if [ -n "$fast_project" ] && [ -f "$fast_state" ]; then
 		fast_project_id="$(jq -er '.project_id' "$fast_state" 2>/dev/null || true)"
 		fast_worker="${XDG_CACHE_HOME:-$HOME/.cache}/broz/workers/$fast_project_id.json"
@@ -23,7 +29,7 @@ if [ "${BROZ_FORCE_LEGACY:-0}" != 1 ] && [ "${1:-}" = deploy ] && [ "$#" -ge 2 ]
 		fi
 		if [ "$fast_mode" = 600 ]; then
 			fast_started="$(perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'printf "%.0f",clock_gettime(CLOCK_MONOTONIC)*1000')"
-			fast_response="$(perl -MIO::Socket::UNIX -MSocket -e '$SIG{ALRM}=sub{die "timeout\n"}; alarm 190; my $s=IO::Socket::UNIX->new(Type=>SOCK_STREAM,Peer=>$ARGV[0]) or die "connect\n"; print $s "{\"command\":\"deploy\",\"fallback\":\"cold\"}\n"; shutdown($s,1); local $/; print <$s>; alarm 0' "$fast_socket")" || { printf 'broz: prepared worker response is uncertain; inspect status before retrying\n' >&2; exit 1; }
+			fast_response="$(perl -MIO::Socket::UNIX -MSocket -MJSON::PP -e '$SIG{ALRM}=sub{die "timeout\n"}; alarm 190; my $s=IO::Socket::UNIX->new(Type=>SOCK_STREAM,Peer=>$ARGV[0]) or die "connect\n"; print $s encode_json({command=>"deploy",fallback=>$ARGV[1]}),"\n"; shutdown($s,1); local $/; print <$s>; alarm 0' "$fast_socket" "$fast_fallback")" || { printf 'broz: prepared worker response is uncertain; inspect status before retrying\n' >&2; exit 1; }
 			if jq -e '.ok == true' >/dev/null 2>&1 <<<"$fast_response"; then
 				fast_finished="$(perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'printf "%.0f",clock_gettime(CLOCK_MONOTONIC)*1000')"
 				fast_response="$(jq -c --argjson ms "$((fast_finished-fast_started))" '.worker="persistent_socket" | .timings.command_total_ms=$ms | .timings.within_1s=($ms<1000)' <<<"$fast_response")"
