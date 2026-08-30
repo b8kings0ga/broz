@@ -13,22 +13,49 @@ python3 "$CODEX_HOME/skills/.system/skill-creator/scripts/quick_validate.py" \
 
 Restart Codex after installation. You can then ask: “Deploy this project to Broz with the domain `my-demo`.”
 
-The script can also be run directly:
+The script can also be run directly. Guest deployments retain the compatible
+cold path:
 
 ```bash
 bash skills/broz-deploy/scripts/broz-deploy.sh deploy . --domain my-demo
 ```
 
-It packages locally, uploads an artifact, creates or reuses one isolated guest service, begins watching the public URL concurrently with the Deploy request, downloads the complete homepage, verifies HTTP 200 and the exact `X-Mim-Deployment` header, then opens the URL. The JSON reports `upload_to_ready_ms` and `deploy_to_ready_ms`; `within_10s` is based on upload-to-ready time. A single successful run is a measurement, not a 10-second SLA.
+For an enabled Membership profile, start asynchronous preparation while coding:
+
+```bash
+bash skills/broz-deploy/scripts/broz-deploy.sh prepare . --profile PROFILE --watch --no-open
+bash skills/broz-deploy/scripts/broz-deploy.sh deploy . --profile PROFILE
+```
+
+The watcher uses latest-wins revisions and prepares the exact source manifest,
+dependency layer, node CAS, persistent slot, route and public connections ahead
+of `deploy`. Bun and Python upload deterministic file manifests; an amd64 Linux
+binary is zstd-compressed, uploaded with transport/content digests, and verified
+after node-side decompression. The deploy command freezes the source again and
+uses the hot path only when its receipt exactly matches the manifest, dependency
+digest and slot incarnation. Otherwise the remaining preparation is included in
+the command time, or the existing cold path is used when the hot path explicitly
+fails before switching.
+
+Success always requires the complete public homepage to return HTTP 200 with
+`X-Mim-Deployment` exactly equal to the new deployment. A successful sub-second
+sample is a measurement under prepared conditions, not an SLA. The JSON reports
+`mode`, preparation/activation stage timings, `command_total_ms`, and
+`within_1s`. The older guest path continues to report its upload/deploy timings
+and `within_10s`.
 
 See [runtime contracts](skills/broz-deploy/references/runtime-contracts.md) for the accepted project layouts.
 
 ## Local state and privacy
 
 - `.broz.json` contains only non-secret project and service identifiers.
+- Named account credentials live only in `~/.config/broz/profiles/`; prepared
+  receipts, worker metadata and logs live under `~/.cache/broz/`, all private.
 - The high-entropy guest credential is stored at `~/.config/broz/credentials/<project-id>.json` with mode `0600`.
 - Credentials are never passed on the command line or printed.
 - Guest previews are free, limited, and remain until explicitly deleted.
+- Fast mode keeps a slot running and is billed for its running minutes. `stop` is
+  reversible; `delete --yes` removes the service and project-local worker state.
 
 ## License
 

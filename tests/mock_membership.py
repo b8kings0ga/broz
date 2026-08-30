@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import argparse, hashlib, io, json, os, tarfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
-state = {"services": {}, "deployments": 0}
+state = {"services": {}, "deployments": 0, "revisions": 0, "blobs": {}}
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
@@ -26,6 +27,17 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/services":
             body = json.loads(self.body()); service = {"id": "svc_test", "name": body["name"], "status": "stopped", "artifact_id": body["artifact_id"], "active_deployment_id": "", "hostname": "127.0.0.1:%d" % self.server.server_port}
             state["services"][service["id"]] = service; self.send_json(201, service); return
+        if self.path.endswith("/revisions"):
+            body = json.loads(self.body()); state["revisions"] += 1; revision = "rev_%d" % state["revisions"]
+            missing = [{"transport_sha256": blob["transport_sha256"], "upload_url": self.path + "/" + revision + "/blobs/" + blob["transport_sha256"].removeprefix("sha256:")} for blob in body["blobs"]]
+            self.send_json(201, {"revision_id": revision, "state": "uploading", "missing_blobs": missing}); return
+        if self.path.endswith("/prepare"):
+            self.body(); revision = self.path.split("/")[-2]; self.send_json(200, {"revision_id": revision, "state": "prepared", "prepared_receipt": "receipt_"+revision, "prepared_at": "2026-08-30T00:00:00Z", "metrics_ms": {"cas_materialize": 1}}); return
+        if self.path.endswith("/activate"):
+            self.body(); state["deployments"] += 1; deployment = "dep_%d" % state["deployments"]
+            service = state["services"]["svc_test"]; service.update(status="running", active_deployment_id=deployment)
+            revision = self.path.split("/")[-2]
+            self.send_json(200, {"status": "accessible", "mode": "hot", "service_id": "svc_test", "revision_id": revision, "deployment_id": deployment, "public_url": "http://"+service["hostname"], "metrics_ms": {"child_spawn": 2}}); return
         if self.path.endswith("/deploy"):
             self.body(); state["deployments"] += 1; deployment = "dep_%d" % state["deployments"]
             service = state["services"]["svc_test"]; service.update(status="running", active_deployment_id=deployment)
@@ -35,12 +47,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not_found"})
     def do_GET(self):
         if self.path == "/v1/services": self.send_json(200, {"items": list(state["services"].values())}); return
-        if self.path == "/":
+        if self.path == "/v1/services/svc_test" and "svc_test" in state["services"]: self.send_json(200, state["services"]["svc_test"]); return
+        if urlsplit(self.path).path == "/":
             dep = state["services"].get("svc_test", {}).get("active_deployment_id", "")
             data = b"<!doctype html><title>Broz mock</title>"
             # HTTP/2 gateways commonly normalize field names to lowercase. Keep
             # the mock that way so macOS/BSD awk compatibility is exercised.
             self.send_response(200); self.send_header("x-mim-deployment", dep); self.send_header("content-length", str(len(data))); self.end_headers(); self.wfile.write(data); return
+        self.send_json(404, {"error": "not_found"})
+    def do_PUT(self):
+        if self.path.endswith("/fast-mode"):
+            self.body(); self.send_json(200, {"enabled": True, "billing": "running_per_minute", "slot": {"id": "slot_test", "state": "ready"}}); return
+        if "/blobs/" in self.path:
+            state["blobs"][self.path.rsplit("/", 1)[-1]] = self.body(); self.send_json(201, {"stored": True}); return
         self.send_json(404, {"error": "not_found"})
     def do_DELETE(self):
         if self.path == "/v1/services/svc_test": state["services"].pop("svc_test", None); self.send_response(204); self.end_headers(); return

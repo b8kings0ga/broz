@@ -1,6 +1,57 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+HELPER="$(cd "$(dirname "$0")" && pwd)/broz.py"
+
+# A prepared project already has a long-lived stdlib worker. On platforms with
+# a Unix socket, let the Bash entrypoint use that authenticated 0600 socket
+# directly so the measured deploy command does not pay Python interpreter
+# startup on every revision. Any unavailable precondition falls through to the
+# portable Python helper before an activation request is sent.
+if [ "${BROZ_FORCE_LEGACY:-0}" != 1 ] && [ "${1:-}" = deploy ] && [ "$#" -ge 2 ] && command -v jq >/dev/null 2>&1 && command -v perl >/dev/null 2>&1; then
+	fast_project="$(cd "$2" 2>/dev/null && pwd || true)"
+	fast_state="$fast_project/.broz.json"
+	fast_open=1
+	for fast_argument in "$@"; do [ "$fast_argument" != --no-open ] || fast_open=0; done
+	if [ -n "$fast_project" ] && [ -f "$fast_state" ]; then
+		fast_project_id="$(jq -er '.project_id' "$fast_state" 2>/dev/null || true)"
+		fast_worker="${XDG_CACHE_HOME:-$HOME/.cache}/broz/workers/$fast_project_id.json"
+		fast_socket="$(jq -er '.socket_path' "$fast_worker" 2>/dev/null || true)"
+		fast_mode=""
+		if [ -n "$fast_socket" ] && [ -S "$fast_socket" ]; then
+			if stat -f '%Lp' "$fast_socket" >/dev/null 2>&1; then fast_mode="$(stat -f '%Lp' "$fast_socket")"; else fast_mode="$(stat -c '%a' "$fast_socket" 2>/dev/null || true)"; fi
+		fi
+		if [ "$fast_mode" = 600 ]; then
+			fast_started="$(perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'printf "%.0f",clock_gettime(CLOCK_MONOTONIC)*1000')"
+			fast_response="$(perl -MIO::Socket::UNIX -MSocket -e '$SIG{ALRM}=sub{die "timeout\n"}; alarm 190; my $s=IO::Socket::UNIX->new(Type=>SOCK_STREAM,Peer=>$ARGV[0]) or die "connect\n"; print $s "{\"command\":\"deploy\",\"fallback\":\"cold\"}\n"; shutdown($s,1); local $/; print <$s>; alarm 0' "$fast_socket")" || { printf 'broz: prepared worker response is uncertain; inspect status before retrying\n' >&2; exit 1; }
+			if jq -e '.ok == true' >/dev/null 2>&1 <<<"$fast_response"; then
+				fast_finished="$(perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'printf "%.0f",clock_gettime(CLOCK_MONOTONIC)*1000')"
+				fast_response="$(jq -c --argjson ms "$((fast_finished-fast_started))" '.worker="persistent_socket" | .timings.command_total_ms=$ms | .timings.within_1s=($ms<1000)' <<<"$fast_response")"
+				if [ "$fast_open" -eq 1 ]; then
+					fast_url="$(jq -er '.public_url' <<<"$fast_response")"
+					if command -v open >/dev/null 2>&1; then open "$fast_url" >/dev/null 2>&1 & elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$fast_url" >/dev/null 2>&1 & fi
+				fi
+				printf '%s\n' "$fast_response"
+				exit 0
+			fi
+			printf 'broz: %s\n' "$(jq -r '.error // "prepared worker failed"' <<<"$fast_response")" >&2
+			exit 1
+		fi
+	fi
+fi
+
+if [ "${BROZ_FORCE_LEGACY:-0}" != 1 ] && [ "$#" -ge 2 ] && command -v python3 >/dev/null 2>&1; then
+	case "$1" in
+		prepare|_watch) exec python3 "$HELPER" "$@";;
+		deploy|status|stop|delete)
+			use_helper=0
+			for argument in "$@"; do [ "$argument" != "--profile" ] || use_helper=1; done
+			if [ "$use_helper" -eq 0 ] && [ -f "$2/.broz.json" ] && command -v jq >/dev/null 2>&1 && jq -e '.profile | type=="string" and length>0' "$2/.broz.json" >/dev/null 2>&1; then use_helper=1; fi
+			[ "$use_helper" -eq 0 ] || exec python3 "$HELPER" "$@"
+			;;
+	esac
+fi
+
 API_URL="${BROZ_API_URL:-https://mimir.broz.uk}"
 PUBLIC_SCHEME="${BROZ_PUBLIC_SCHEME:-https}"
 OPEN_BROWSER=1
@@ -22,6 +73,7 @@ progress() { printf 'broz: %s\n' "$*" >&2; }
 usage() {
   cat >&2 <<'EOF'
 usage:
+  broz-deploy.sh prepare PATH [--watch|--once] [--profile NAME] [--runtime auto|bun|python|binary] [--domain NAME] [--binary FILE --arch amd64]
   broz-deploy.sh deploy PATH [--runtime auto|bun|python|binary] [--name NAME] [--domain NAME] [--binary FILE --arch amd64] [--open|--no-open]
   broz-deploy.sh status PATH
   broz-deploy.sh stop PATH
