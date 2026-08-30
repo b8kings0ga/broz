@@ -698,6 +698,8 @@ def ensure_activation_ticket(project: Project, cache: dict, force: bool = False)
     """Pre-authorize one exact node-direct activation outside deploy time."""
     if not force and activation_ticket_usable(cache):
         return cache
+    if not force and float(cache.get("activation_ticket_retry_unix") or 0) > time.time():
+        return cache
     service_id = str(cache.get("service_id") or "")
     revision_id = str(cache.get("revision_id") or "")
     receipt = str(cache.get("prepared_receipt") or "")
@@ -715,7 +717,9 @@ def ensure_activation_ticket(project: Project, cache: dict, force: bool = False)
         # existing central activation path. A missing optimization endpoint is
         # never allowed to make deployment unavailable.
         if exc.status == 404 or exc.code in {"node_direct_unavailable", "membership_runtime_unavailable", "fast_deploy_unavailable"}:
-            return cache
+            value = dict(cache)
+            value["activation_ticket_retry_unix"] = time.time() + 2.0
+            return value
         raise
     expected = fast_deployment_id(project.user_id, service_id, revision_id, request_id)
     activation_url = str(ticket.get("activation_url") or "")
@@ -740,6 +744,7 @@ def ensure_activation_ticket(project: Project, cache: dict, force: bool = False)
         "activation_deployment_id": expected,
         "activation_expires_unix": int(ticket.get("expires_unix") or 0),
     })
+    value.pop("activation_ticket_retry_unix", None)
     return value
 
 
@@ -1284,7 +1289,7 @@ def watch(project: Project) -> None:
                     cached = load_json(project.cache_path, required=False)
                     if cached.get("prepared_receipt") and not activation_ticket_usable(cached):
                         with project.lock():
-                            cached = ensure_activation_ticket(project, cached, force=True)
+                            cached = ensure_activation_ticket(project, cached)
                             atomic_json(project.cache_path, {key: value for key, value in cached.items() if key != "cache_hit"}, 0o600)
                         warm_node_activation_connection(project, cached)
             except Exception as exc:  # fixed fields only; never print credentials or request headers

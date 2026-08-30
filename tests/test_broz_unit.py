@@ -139,7 +139,9 @@ class ActivationTicketFallbackTests(unittest.TestCase):
 
         project = type("Project", (), {"api": UnavailableAPI(), "user_id": "user", "state": {}})()
         cache = {"service_id": "svc", "revision_id": "rev", "prepared_receipt": "receipt"}
-        self.assertEqual(broz.ensure_activation_ticket(project, cache, force=True), cache)
+        result = broz.ensure_activation_ticket(project, cache, force=True)
+        self.assertNotIn("activation_ticket", result)
+        self.assertGreater(result["activation_ticket_retry_unix"], time.time())
 
 
 if __name__ == "__main__":
