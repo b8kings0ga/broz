@@ -18,7 +18,7 @@ class FakeAPI:
     def __init__(self, name, delay, calls):
         self.name, self.delay, self.calls = name, delay, calls
 
-    def activate_stream(self, path, body, request_id, on_started):
+    def activate_stream(self, path, body, request_id, on_started, continue_existing=False):
         self.calls.append(self.name)
         time.sleep(self.delay)
         deployment = {"deployment_id": "dep_exact", "status": "activated"}

@@ -178,7 +178,7 @@ class API:
                     raise BrozError(f"Membership request failed: {method} {path}") from exc
         raise BrozError(f"Membership request failed: {method} {path}")
 
-    def activate_stream(self, path: str, value: dict, request_id: str, on_started) -> dict:
+    def activate_stream(self, path: str, value: dict, request_id: str, on_started, continue_existing: bool = False) -> dict:
         parsed = urllib.parse.urlsplit(self.base + path)
         request_path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         headers = {
@@ -188,6 +188,8 @@ class API:
             "Idempotency-Key": request_id,
             "User-Agent": "broz-deploy/1.0",
         }
+        if continue_existing:
+            headers["X-Broz-Continue"] = "1"
         key, connection = self.connection(parsed, 35)
         try:
             connection.request("POST", request_path, body=json.dumps(value, separators=(",", ":")).encode(), headers=headers)
@@ -313,9 +315,13 @@ class Project:
         # race. A single Cloudflare/TCP path occasionally adds >1s even while
         # the slot itself switches in ~100ms.
         self.activation_api = API(self.api.base, str(auth["token"]), self.source_address)
+        self.reconcile_api = API(self.api.base, str(auth["token"]), self.source_address)
+        self.node_api: API | None = None
+        self.node_api_hostname = ""
         self.cache_path = cache_root / "projects" / f"{self.project_id}.json"
         self.lock_path = cache_root / "locks" / f"{self.project_id}.lock"
         self.worker_path = cache_root / "workers" / f"{self.project_id}.json"
+        self.reconcile_path = cache_root / "reconcile" / f"{self.project_id}.json"
         self.socket_path = cache_root / "workers" / f"{self.project_id}.sock"
         # sockaddr_un is only 104 bytes on macOS. Keep the normal socket in the
         # private cache, but use a private short runtime directory when an XDG
@@ -620,6 +626,7 @@ def ensure_prepared(project: Project, force_slot_check: bool = False, force_repr
             if cached.get("content_snapshot_digest") != snapshot["content_snapshot_digest"]:
                 cached["content_snapshot_digest"] = snapshot["content_snapshot_digest"]
                 atomic_json(project.cache_path, cached, 0o600)
+            cached = ensure_activation_ticket(project, cached)
             return cached | {"cache_hit": True, "snapshot_ms": snapshot_ms}
         if not force_slot_check and cached.get("service_id") and cached.get("slot_id") and cached.get("slot_incarnation_id") and cached.get("slot_generation"):
             slot = {"id": cached["slot_id"], "incarnation_id": cached["slot_incarnation_id"], "generation": cached["slot_generation"], "state": "ready"}
@@ -632,6 +639,7 @@ def ensure_prepared(project: Project, force_slot_check: bool = False, force_repr
             if cached.get("content_snapshot_digest") != snapshot["content_snapshot_digest"]:
                 cached["content_snapshot_digest"] = snapshot["content_snapshot_digest"]
                 atomic_json(project.cache_path, cached, 0o600)
+            cached = ensure_activation_ticket(project, cached)
             return cached | {"cache_hit": True, "snapshot_ms": snapshot_ms}
         # Local content_snapshot_digest is only a deploy-time shortcut. It is
         # not part of the signed RevisionTransportV2 wire contract.
@@ -670,9 +678,130 @@ def ensure_prepared(project: Project, force_slot_check: bool = False, force_repr
         prepare_ms = monotonic_ms() - prepare_started
         slot = prepared.get("slot") or slot
         cache = {"project_id": project.project_id, "service_id": service["id"], "hostname": service["hostname"], "runtime": project.runtime, "arch": project.arch, "slot_id": slot.get("id", ""), "slot_incarnation_id": slot.get("incarnation_id", ""), "slot_generation": slot.get("generation", 0), "manifest_digest": snapshot["manifest_digest"], "content_snapshot_digest": snapshot["content_snapshot_digest"], "dependency_digest": snapshot["dependency_digest"], "revision_id": revision, "prepared_receipt": prepared["prepared_receipt"], "prepared_at": prepared.get("prepared_at", ""), "prepare_metrics_ms": prepared.get("metrics_ms", {}), "snapshot_ms": snapshot_ms, "upload_ms": upload_ms, "prepare_api_ms": prepare_ms, "cache_hit": False}
+        cache = ensure_activation_ticket(project, cache)
         if persist:
             atomic_json(project.cache_path, cache, 0o600)
         return cache
+
+
+def activation_ticket_usable(cache: dict, margin: float = 15.0) -> bool:
+    return bool(
+        cache.get("activation_ticket")
+        and cache.get("activation_url")
+        and cache.get("activation_request_id")
+        and cache.get("activation_deployment_id")
+        and float(cache.get("activation_expires_unix") or 0) > time.time() + margin
+    )
+
+
+def ensure_activation_ticket(project: Project, cache: dict, force: bool = False) -> dict:
+    """Pre-authorize one exact node-direct activation outside deploy time."""
+    if not force and activation_ticket_usable(cache):
+        return cache
+    service_id = str(cache.get("service_id") or "")
+    revision_id = str(cache.get("revision_id") or "")
+    receipt = str(cache.get("prepared_receipt") or "")
+    if not service_id or not revision_id or not receipt:
+        return cache
+    request_id = str(cache.get("activation_request_id") or ("broz_ticket_" + secrets.token_urlsafe(24).replace("-", "_")))
+    path = f"/v1/services/{service_id}/revisions/{revision_id}/activation-ticket"
+    try:
+        ticket, _, _ = project.api.request(
+            "POST", path, {"prepared_receipt": receipt}, timeout=15,
+            headers={"Idempotency-Key": request_id},
+        )
+    except BrozError as exc:
+        # Rolling upgrades and older public Membership installations retain the
+        # existing central activation path. A missing optimization endpoint is
+        # never allowed to make deployment unavailable.
+        if exc.status == 404 or exc.code == "node_direct_unavailable":
+            return cache
+        raise
+    expected = fast_deployment_id(project.user_id, service_id, revision_id, request_id)
+    activation_url = str(ticket.get("activation_url") or "")
+    parsed = urllib.parse.urlsplit(activation_url)
+    expected_hostname = str(cache.get("hostname") or project.state.get("hostname") or "").lower()
+    if (
+        str(ticket.get("service_id") or "") != service_id
+        or str(ticket.get("revision_id") or "") != revision_id
+        or str(ticket.get("request_id") or "") != request_id
+        or str(ticket.get("deployment_id") or "") != expected
+        or not str(ticket.get("activation_ticket") or "")
+        or parsed.scheme not in {"http", "https"}
+        or parsed.hostname != urllib.parse.urlsplit("//" + expected_hostname).hostname
+        or not parsed.path.endswith(f"/__mim/v1/revisions/{revision_id}/activate")
+    ):
+        raise BrozError("Membership returned an invalid activation ticket", code="invalid_activation_ticket")
+    value = dict(cache)
+    value.update({
+        "activation_ticket": str(ticket["activation_ticket"]),
+        "activation_url": activation_url,
+        "activation_request_id": request_id,
+        "activation_deployment_id": expected,
+        "activation_expires_unix": int(ticket.get("expires_unix") or 0),
+    })
+    return value
+
+
+def node_activation_api(project: Project, cache: dict) -> API:
+    parsed = urllib.parse.urlsplit(str(cache["activation_url"]))
+    base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    if project.node_api is None or project.node_api_hostname != base:
+        project.node_api = API(base, str(cache["activation_ticket"]), project.source_address)
+        project.node_api_hostname = base
+    else:
+        project.node_api.token = str(cache["activation_ticket"])
+    return project.node_api
+
+
+def warm_node_activation_connection(project: Project, cache: dict) -> None:
+    if not activation_ticket_usable(cache):
+        return
+    with contextlib.suppress(BrozError):
+        node_activation_api(project, cache).request("GET", "/__mim/slot-healthz", timeout=6)
+
+
+def activate_node_direct(project: Project, cache: dict) -> tuple[dict, int]:
+    started = monotonic_ms()
+    parsed = urllib.parse.urlsplit(str(cache["activation_url"]))
+    result, _, _ = node_activation_api(project, cache).request(
+        "POST", parsed.path, {"prepared_receipt": cache["prepared_receipt"]}, timeout=5,
+    )
+    elapsed = monotonic_ms() - started
+    expected = str(cache["activation_deployment_id"])
+    if not result.get("switched") or str(result.get("deployment_id") or "") != expected:
+        raise BrozError("node-direct activation returned an invalid identity", code="invalid_activation_response")
+    result.update({
+        "status": "activated", "mode": "hot", "service_id": cache["service_id"],
+        "revision_id": cache["revision_id"], "public_url": os.environ.get("BROZ_PUBLIC_SCHEME", "https") + "://" + str(cache["hostname"]),
+        "expected_deployment_header": expected,
+    })
+    return result, elapsed
+
+
+def queue_activation_reconcile(project: Project, cache: dict) -> None:
+    atomic_json(project.reconcile_path, {
+        "service_id": cache["service_id"], "revision_id": cache["revision_id"],
+        "deployment_id": cache["activation_deployment_id"],
+        "request_id": cache["activation_request_id"],
+        "prepared_receipt": cache["prepared_receipt"],
+    }, 0o600)
+
+
+def reconcile_queued_activation(project: Project) -> bool:
+    queued = load_json(project.reconcile_path, required=False)
+    if not queued:
+        return True
+    path = f"/v1/services/{queued['service_id']}/revisions/{queued['revision_id']}/activate"
+    result, _, _ = project.reconcile_api.request(
+        "POST", path, {"prepared_receipt": queued["prepared_receipt"]}, timeout=35,
+        headers={"Idempotency-Key": queued["request_id"], "X-Broz-Continue": "1"},
+    )
+    if str(result.get("deployment_id") or "") != str(queued["deployment_id"]) or result.get("status") not in {"activated", "accessible"}:
+        raise BrozError("Membership activation reconciliation is not complete", code="activation_reconciling")
+    with contextlib.suppress(FileNotFoundError):
+        project.reconcile_path.unlink()
+    return True
 
 
 def wait_page(project: Project, deployment_id: str, timeout: float = 120.0, stop: threading.Event | None = None, lane: int = 0) -> int:
@@ -776,7 +905,7 @@ def warm_membership_connections(project: Project) -> None:
         lane.join(timeout=7)
 
 
-def race_activation(project: Project, path: str, body: dict, request_id: str, on_started) -> tuple[dict, int, int]:
+def race_activation(project: Project, path: str, body: dict, request_id: str, on_started, continue_existing: bool = False) -> tuple[dict, int, int]:
     outcomes: queue.Queue[tuple[str, object, int, int]] = queue.Queue()
     identity_seen = threading.Event()
 
@@ -795,7 +924,7 @@ def race_activation(project: Project, path: str, body: dict, request_id: str, on
             on_started(value)
 
         try:
-            result = api.activate_stream(path, body, request_id, started)
+            result = api.activate_stream(path, body, request_id, started, continue_existing=continue_existing)
             outcomes.put(("ok", result, first_seen, monotonic_ms() - lane_started))
         except BrozError as exc:
             outcomes.put(("error", exc, first_seen, monotonic_ms() - lane_started))
@@ -822,7 +951,7 @@ def race_activation(project: Project, path: str, body: dict, request_id: str, on
     raise preferred
 
 
-def hot_deploy(project: Project, fallback: str) -> dict:
+def hot_deploy(project: Project, fallback: str, allow_direct: bool = False) -> dict:
     started = monotonic_ms()
     with project.lock():
         snapshot_started = monotonic_ms()
@@ -838,11 +967,20 @@ def hot_deploy(project: Project, fallback: str) -> dict:
         if not prepare_cache_hit:
             cached = ensure_prepared(project)
             prepare_cache_hit = bool(cached.get("cache_hit"))
+        if allow_direct and not activation_ticket_usable(cached):
+            cached = ensure_activation_ticket(project, cached, force=True)
+            atomic_json(project.cache_path, {key: value for key, value in cached.items() if key != "cache_hit"}, 0o600)
         residual_ms = monotonic_ms() - residual_started
         service_id, revision = cached["service_id"], cached["revision_id"]
-        request_id = "broz_" + secrets.token_urlsafe(24).replace("-", "_")
-        expected_deployment = fast_deployment_id(project.user_id, service_id, revision, request_id)
+        node_direct = allow_direct and activation_ticket_usable(cached)
+        if node_direct:
+            request_id = str(cached["activation_request_id"])
+            expected_deployment = str(cached["activation_deployment_id"])
+        else:
+            request_id = "broz_" + secrets.token_urlsafe(24).replace("-", "_")
+            expected_deployment = fast_deployment_id(project.user_id, service_id, revision, request_id)
         activate_started = monotonic_ms()
+        activation_transport = "membership"
         page_started = 0
         page_result: dict[str, object] = {}
         page_stop = threading.Event()
@@ -897,14 +1035,29 @@ def hot_deploy(project: Project, fallback: str) -> dict:
             try:
                 activation_path = f"/v1/services/{service_id}/revisions/{revision}/activate"
                 activation_body = {"prepared_receipt": cached["prepared_receipt"]}
-                begin_started = monotonic_ms()
 
                 def stream_started(first: dict) -> None:
                     if str(first.get("deployment_id") or "") != expected_deployment:
                         raise BrozError("activation stream returned an unexpected deployment identity", code="activation_reconciling")
                     activation_started(first)
 
-                result, begin_ms, complete_ms = race_activation(project, activation_path, activation_body, request_id, stream_started)
+                if node_direct:
+                    try:
+                        result, complete_ms = activate_node_direct(project, cached)
+                        begin_ms = 0
+                        activation_transport = "node_direct"
+                    except BrozError:
+                        # The reserved request/deployment identity is shared by
+                        # both paths. A lost direct response can therefore be
+                        # reconciled centrally without spawning a second
+                        # deployment or permitting a cold duplicate.
+                        result, begin_ms, complete_ms = race_activation(
+                            project, activation_path, activation_body, request_id,
+                            stream_started, continue_existing=True,
+                        )
+                        activation_transport = "membership_fallback"
+                else:
+                    result, begin_ms, complete_ms = race_activation(project, activation_path, activation_body, request_id, stream_started)
                 break
             except BrozError as exc:
                 if exc.code == "prepared_receipt_mismatch" and prepare_retries == 0:
@@ -912,7 +1065,12 @@ def hot_deploy(project: Project, fallback: str) -> dict:
                     cached = ensure_prepared(project, force_slot_check=True, force_reprepare=True)
                     residual_ms += monotonic_ms() - retry_started
                     service_id, revision = cached["service_id"], cached["revision_id"]
-                    next_deployment = fast_deployment_id(project.user_id, service_id, revision, request_id)
+                    node_direct = allow_direct and activation_ticket_usable(cached)
+                    if node_direct:
+                        request_id = str(cached["activation_request_id"])
+                        next_deployment = str(cached["activation_deployment_id"])
+                    else:
+                        next_deployment = fast_deployment_id(project.user_id, service_id, revision, request_id)
                     if next_deployment != expected_deployment:
                         page_stop.set()
                         if page_thread is not None:
@@ -935,6 +1093,16 @@ def hot_deploy(project: Project, fallback: str) -> dict:
                 cold["hot_failure"] = exc.code or str(exc)
                 cold["timings"]["total_ms"] = monotonic_ms() - started
                 return cold
+        if node_direct:
+            if activation_transport == "node_direct":
+                # Persist the recovery work before reporting public success.
+                # The watcher performs the slower Membership commit after the
+                # user-visible command has returned.
+                queue_activation_reconcile(project, cached)
+            consumed = dict(cached)
+            for key in ("activation_ticket", "activation_url", "activation_request_id", "activation_deployment_id", "activation_expires_unix"):
+                consumed.pop(key, None)
+            atomic_json(project.cache_path, {key: value for key, value in consumed.items() if key != "cache_hit"}, 0o600)
         activate_ms = monotonic_ms() - activate_started
         if page_thread is None:
             raise BrozError("activation did not reveal deployment identity")
@@ -958,7 +1126,7 @@ def hot_deploy(project: Project, fallback: str) -> dict:
         total_ms = monotonic_ms() - started
         prepare_summary = {key: cached.get(key) for key in ("prepared_at", "prepare_metrics_ms", "snapshot_ms", "upload_ms", "prepare_api_ms")}
         prepare_summary["cache_hit"] = prepare_cache_hit
-        return {"ok": True, "mode": "hot", "activation_status": result.get("status"), "service_id": service_id, "revision_id": revision, "deployment_id": result["deployment_id"], "public_url": public_url, "prepare": prepare_summary, "activation_metrics_ms": result.get("metrics_ms", {}), "timings": {"snapshot_ms": snapshot_ms, "residual_prepare_ms": residual_ms, "deployment_id_ready_ms": 0, "activation_response_first_ms": begin_ms, "activate_begin_api_ms": begin_ms, "activate_complete_api_ms": complete_ms, "activate_api_ms": activate_ms, "page_ready_ms": monotonic_ms() - page_started, "public_fetch_ms": page_ms, "total_ms": total_ms, "within_1s": total_ms < 1000}}
+        return {"ok": True, "mode": "hot", "activation_transport": activation_transport, "membership_reconcile": "queued" if activation_transport == "node_direct" else "committed", "activation_status": result.get("status"), "service_id": service_id, "revision_id": revision, "deployment_id": result["deployment_id"], "public_url": public_url, "prepare": prepare_summary, "activation_metrics_ms": result.get("metrics_ms", {}), "timings": {"snapshot_ms": snapshot_ms, "residual_prepare_ms": residual_ms, "deployment_id_ready_ms": 0, "activation_response_first_ms": begin_ms, "activate_begin_api_ms": begin_ms, "activate_complete_api_ms": complete_ms, "activate_api_ms": activate_ms, "page_ready_ms": monotonic_ms() - page_started, "public_fetch_ms": page_ms, "total_ms": total_ms, "within_1s": total_ms < 1000}}
 
 
 def worker_reply(connection: socket.socket, value: dict) -> None:
@@ -1007,7 +1175,7 @@ def service_action(project: Project, command: str) -> dict:
     if command != "delete":
         raise BrozError(f"unsupported service action: {command}")
     project.api.request("DELETE", f"/v1/services/{service_id}")
-    for path in (project.state_path, project.cache_path, project.worker_path, project.log_path):
+    for path in (project.state_path, project.cache_path, project.worker_path, project.log_path, project.reconcile_path):
         with contextlib.suppress(FileNotFoundError):
             path.unlink()
     # Named profiles belong to the account and survive project deletion. Only
@@ -1053,6 +1221,8 @@ def watch(project: Project) -> None:
     server.settimeout(0.02)
     last, changed_at = "", 0.0
     next_scan = 0.0
+    next_reconcile = 0.0
+    reconcile_thread: threading.Thread | None = None
     try:
         while True:
             try:
@@ -1069,7 +1239,7 @@ def watch(project: Project) -> None:
                             return
                         if request.get("command") != "deploy":
                             raise BrozError("unsupported worker command")
-                        result = hot_deploy(project, str(request.get("fallback") or "cold"))
+                        result = hot_deploy(project, str(request.get("fallback") or "cold"), allow_direct=True)
                         worker_reply(connection, result)
                     except BrozError as exc:
                         worker_reply(connection, {"ok": False, "error": str(exc), "code": exc.code})
@@ -1081,6 +1251,14 @@ def watch(project: Project) -> None:
             if now < next_scan:
                 continue
             next_scan = now + 0.25
+            if project.reconcile_path.exists() and now >= next_reconcile and (reconcile_thread is None or not reconcile_thread.is_alive()):
+                def reconcile() -> None:
+                    with contextlib.suppress(BrozError, OSError, KeyError):
+                        reconcile_queued_activation(project)
+
+                reconcile_thread = threading.Thread(target=reconcile, name="broz-membership-reconcile", daemon=True)
+                reconcile_thread.start()
+                next_reconcile = now + 1.0
             try:
                 signature = source_signature(project)
                 if signature != last:
@@ -1090,6 +1268,7 @@ def watch(project: Project) -> None:
                         result = ensure_prepared(project, persist=False)
                     warm_membership_connections(project)
                     warm_public_connections(project)
+                    warm_node_activation_connection(project, result)
                     if not result.get("cache_hit") and project.active_deployment_id:
                         with contextlib.suppress(BrozError):
                             wait_page(project, project.active_deployment_id, timeout=3)
@@ -1101,6 +1280,13 @@ def watch(project: Project) -> None:
                         atomic_json(project.cache_path, {key: value for key, value in result.items() if key != "cache_hit"}, 0o600)
                     print(json.dumps({"event": "prepared", "at_unix_ms": time.time_ns() // 1_000_000, "revision_id": result["revision_id"], "manifest_digest": result["manifest_digest"]}), flush=True)
                     changed_at = 0.0
+                elif not project.reconcile_path.exists():
+                    cached = load_json(project.cache_path, required=False)
+                    if cached.get("prepared_receipt") and not activation_ticket_usable(cached):
+                        with project.lock():
+                            cached = ensure_activation_ticket(project, cached, force=True)
+                            atomic_json(project.cache_path, {key: value for key, value in cached.items() if key != "cache_hit"}, 0o600)
+                        warm_node_activation_connection(project, cached)
             except Exception as exc:  # fixed fields only; never print credentials or request headers
                 failure = {"event": "prepare_failed", "at_unix_ms": time.time_ns() // 1_000_000, "error": type(exc).__name__}
                 if isinstance(exc, BrozError):
@@ -1215,7 +1401,7 @@ def main(argv: list[str]) -> int:
     worker_started = monotonic_ms()
     result = worker_request(project, arguments.fallback)
     if result is None:
-        result = hot_deploy(project, arguments.fallback)
+        result = hot_deploy(project, arguments.fallback, allow_direct=False)
         result["worker"] = "direct_fallback"
     else:
         result["worker"] = "persistent"

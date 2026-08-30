@@ -33,9 +33,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(201, {"revision_id": revision, "state": "uploading", "missing_blobs": missing}); return
         if self.path.endswith("/prepare"):
             self.body(); revision = self.path.split("/")[-2]; self.send_json(200, {"revision_id": revision, "state": "prepared", "prepared_receipt": "receipt_"+revision, "prepared_at": "2026-08-30T00:00:00Z", "metrics_ms": {"cas_materialize": 1}}); return
+        if self.path.endswith("/activation-ticket"):
+            self.body(); revision = self.path.split("/")[-2]; request_id = self.headers.get("Idempotency-Key", "")
+            identity = "\0".join(("mock-user", "svc_test", revision, request_id)).encode()
+            deployment = "dep_" + base64.urlsafe_b64encode(hashlib.sha256(identity).digest()[:18]).decode().rstrip("=")
+            self.send_json(201, {"status": "prepared", "mode": "node_direct", "service_id": "svc_test", "revision_id": revision, "deployment_id": deployment, "request_id": request_id, "activation_ticket": "ticket:"+deployment, "activation_url": "http://127.0.0.1:%d/__mim/v1/revisions/%s/activate" % (self.server.server_port, revision), "public_url": "http://127.0.0.1:%d" % self.server.server_port, "expected_deployment_header": deployment, "expires_unix": int(__import__('time').time())+300}); return
+        if self.path.startswith("/__mim/v1/revisions/") and self.path.endswith("/activate"):
+            self.body(); deployment = self.headers.get("Authorization", "").removeprefix("Bearer ticket:")
+            if not deployment.startswith("dep_"): self.send_json(403, {"error": "invalid_capability"}); return
+            service = state["services"]["svc_test"]; service.update(status="running", active_deployment_id=deployment)
+            self.send_json(200, {"switched": True, "deployment_id": deployment, "metrics_ms": {"child_spawn": 2, "app_health": 3}}); return
         if self.path.endswith("/activate"):
             self.body()
-            if state["activation_mismatch_once"]:
+            if state["activation_mismatch_once"] and self.headers.get("X-Broz-Continue") != "1":
                 state["activation_mismatch_once"] = False
                 self.send_json(409, {"error": "prepared_receipt_mismatch"}); return
             revision = self.path.split("/")[-2]
@@ -53,6 +63,7 @@ class Handler(BaseHTTPRequestHandler):
             self.body(); state["services"]["svc_test"]["status"] = "stopped"; self.send_json(200, {"status": "stopped"}); return
         self.send_json(404, {"error": "not_found"})
     def do_GET(self):
+        if self.path == "/__mim/slot-healthz": self.send_json(200, {"ok": True, "slot_id": "slot_test"}); return
         if self.path == "/v1/services": self.send_json(200, {"items": list(state["services"].values())}); return
         if self.path == "/v1/services/svc_test" and "svc_test" in state["services"]: self.send_json(200, state["services"]["svc_test"]); return
         if urlsplit(self.path).path == "/":

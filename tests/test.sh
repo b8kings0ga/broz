@@ -50,7 +50,12 @@ for _ in $(seq 1 100); do
   sleep .02
 done
 worker_hot="$($SCRIPT deploy "$TMP/hot-project" --profile mock --no-open)"
-jq -e '.ok and (.worker | startswith("persistent")) and (.prepare.cache_hit == true) and (.timings.command_total_ms >= .timings.total_ms)' <<<"$worker_hot" >/dev/null
+jq -e '.ok and (.worker | startswith("persistent")) and .activation_transport=="node_direct" and .membership_reconcile=="queued" and (.prepare.cache_hit == true) and (.timings.command_total_ms >= .timings.total_ms)' <<<"$worker_hot" >/dev/null
+for _ in $(seq 1 150); do
+  [ -z "$(find "$TMP/home/.cache/broz/reconcile" -type f -print -quit 2>/dev/null)" ] && break
+  sleep .02
+done
+[ -z "$(find "$TMP/home/.cache/broz/reconcile" -type f -print -quit 2>/dev/null)" ]
 kill -TERM "$WATCH_PID"
 for _ in $(seq 1 100); do kill -0 "$WATCH_PID" 2>/dev/null || break; sleep .02; done
 [ -S "$socket_path" ]
