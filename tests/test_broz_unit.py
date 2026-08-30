@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import importlib.util
 import contextlib
+import io
+import tempfile
 import threading
 import time
 import unittest
@@ -130,6 +132,23 @@ class ConnectionWarmupTests(unittest.TestCase):
         broz.warm_membership_connections(project)
         self.assertEqual(calls, [("GET", "/healthz", 6), ("GET", "/healthz", 6)])
 
+    def test_independent_warmup_groups_run_in_parallel(self):
+        originals = {name: getattr(broz, name) for name in (
+            "warm_membership_connections", "warm_public_connections", "warm_node_activation_connection",
+        )}
+        calls = []
+        try:
+            for name in originals:
+                setattr(broz, name, lambda *_args, marker=name: (time.sleep(0.04), calls.append(marker)))
+            started = time.monotonic()
+            broz.warm_deploy_connections(object(), {})
+            elapsed = time.monotonic() - started
+        finally:
+            for name, value in originals.items():
+                setattr(broz, name, value)
+        self.assertEqual(set(calls), set(originals))
+        self.assertLess(elapsed, 0.09)
+
 
 class ActivationTicketFallbackTests(unittest.TestCase):
     def test_transient_ticket_failure_keeps_prepared_central_path(self):
@@ -142,6 +161,74 @@ class ActivationTicketFallbackTests(unittest.TestCase):
         result = broz.ensure_activation_ticket(project, cache, force=True)
         self.assertNotIn("activation_ticket", result)
         self.assertGreater(result["activation_ticket_retry_unix"], time.time())
+
+
+class WatcherSchedulingTests(unittest.TestCase):
+    def test_accept_wait_tracks_next_scan_without_delaying_socket_wakeup(self):
+        self.assertEqual(broz.watcher_accept_timeout(10.0, 9.0), 0.001)
+        self.assertAlmostEqual(broz.watcher_accept_timeout(10.0, 10.08), 0.08)
+        self.assertEqual(broz.watcher_accept_timeout(10.0, 11.0), 0.25)
+
+    def test_worker_command_accepts_fragmented_unix_stream_reads(self):
+        class FragmentedSocket:
+            def __init__(self):
+                self.fragments = [b'{"comm', b'and":"de', b'ploy"}\n']
+
+            def recv(self, _limit):
+                return self.fragments.pop(0) if self.fragments else b""
+
+        self.assertEqual(broz.recv_worker_request(FragmentedSocket()), {"command": "deploy"})
+
+    def test_worker_command_rejects_truncated_message(self):
+        class TruncatedSocket:
+            calls = 0
+
+            def recv(self, _limit):
+                self.calls += 1
+                return b'{"command":"deploy"}' if self.calls == 1 else b""
+
+        with self.assertRaises(broz.BrozError):
+            broz.recv_worker_request(TruncatedSocket())
+
+
+class SnapshotFreezeTests(unittest.TestCase):
+    def test_hash_only_freeze_matches_materialized_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "package.json").write_text('{"scripts":{"start":"bun run server.js"}}')
+            (root / "bun.lock").write_text("lockfileVersion = 1\n")
+            (root / "server.js").write_text("Bun.serve({port: 8080})\n")
+            project = type("Project", (), {"root": root, "runtime": "bun", "arch": "amd64", "binary": None})()
+            with tempfile.TemporaryDirectory() as full_dir, tempfile.TemporaryDirectory() as hash_dir:
+                full = broz.prepare_snapshot(project, Path(full_dir), materialize=True)
+                hashed = broz.prepare_snapshot(project, Path(hash_dir), materialize=False)
+            self.assertEqual(full["manifest_digest"], hashed["manifest_digest"])
+            self.assertEqual(full["content_snapshot_digest"], hashed["content_snapshot_digest"])
+            self.assertTrue(all("_local" in blob for blob in full["blobs"]))
+            self.assertTrue(all("_local" not in blob for blob in hashed["blobs"]))
+
+
+class CompletePageTests(unittest.TestCase):
+    class Response:
+        def __init__(self, body, length=None):
+            self.stream = io.BytesIO(body)
+            self.length = length
+
+        def getheader(self, name):
+            return self.length if name == "Content-Length" else None
+
+        def read(self, amount):
+            return self.stream.read(amount)
+
+    def test_complete_page_at_limit_is_accepted(self):
+        body = b"x" * 32
+        self.assertEqual(broz.read_complete_page(self.Response(body, "32"), 32), body)
+
+    def test_declared_or_streamed_oversize_page_is_rejected(self):
+        with self.assertRaises(broz.BrozError):
+            broz.read_complete_page(self.Response(b"", "33"), 32)
+        with self.assertRaises(broz.BrozError):
+            broz.read_complete_page(self.Response(b"x" * 33), 32)
 
 
 if __name__ == "__main__":

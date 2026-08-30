@@ -38,6 +38,7 @@ PUBLIC_LANE_DELAYS_PYTHON = (0.0, 0.04, 0.08, 0.12, 0.18, 0.26)
 ACTIVATION_HEDGE_DELAY = 0.75
 MAX_FILES = 4096
 MAX_EXPANDED = 512 << 20
+MAX_PUBLIC_PAGE = 4 << 20
 EXCLUDED_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".npm", ".aws", ".ssh"}
 EXCLUDED_FILES = {".broz.json", ".npmrc", ".pypirc", "credentials", "credentials.json", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
 SECRET_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
@@ -101,6 +102,20 @@ def load_json(path: Path, required: bool = True) -> dict:
         return {}
     except (OSError, json.JSONDecodeError) as exc:
         raise BrozError(f"invalid JSON file: {path}") from exc
+
+
+def read_complete_page(response: http.client.HTTPResponse, limit: int = MAX_PUBLIC_PAGE) -> bytes:
+    length = response.getheader("Content-Length")
+    if length:
+        try:
+            if int(length) > limit:
+                raise BrozError("public page exceeds 4 MiB", code="public_page_too_large")
+        except ValueError:
+            pass
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        raise BrozError("public page exceeds 4 MiB", code="public_page_too_large")
+    return body
 
 
 def credential(path: Path) -> dict:
@@ -455,7 +470,7 @@ def fast_binary_snapshot_identity(project: Project) -> str:
     return content_snapshot_digest("binary", project.arch, "", [blob])
 
 
-def prepare_snapshot(project: Project, temporary: Path) -> dict:
+def prepare_snapshot(project: Project, temporary: Path, materialize: bool = True) -> dict:
     if project.arch != "amd64":
         raise BrozError("v1 fast deploy supports only amd64")
     if project.runtime == "bun":
@@ -514,9 +529,12 @@ def prepare_snapshot(project: Project, temporary: Path) -> dict:
                 subprocess.run([zstd, "-q", "-c", str(path)], check=True, stdout=output, stderr=subprocess.DEVNULL)
             transport, compression = target.read_bytes(), "zstd"
         transport_digest, content_digest = hashlib.sha256(transport).hexdigest(), hashlib.sha256(content).hexdigest()
-        blob_path = temporary / transport_digest
-        blob_path.write_bytes(transport)
-        blobs.append({"path": relative, "mode": mode, "transport_sha256": "sha256:" + transport_digest, "content_sha256": "sha256:" + content_digest, "compressed_bytes": len(transport), "expanded_bytes": len(content), "compression": compression, "_local": str(blob_path)})
+        blob = {"path": relative, "mode": mode, "transport_sha256": "sha256:" + transport_digest, "content_sha256": "sha256:" + content_digest, "compressed_bytes": len(transport), "expanded_bytes": len(content), "compression": compression}
+        if materialize:
+            blob_path = temporary / transport_digest
+            blob_path.write_bytes(transport)
+            blob["_local"] = str(blob_path)
+        blobs.append(blob)
     canonical = [{key: value for key, value in blob.items() if key != "_local"} for blob in blobs]
     manifest = hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     dependency = hashlib.sha256(b"\x00".join(dependency_parts)).hexdigest() if dependency_parts else ""
@@ -802,14 +820,14 @@ def reconcile_queued_activation(project: Project) -> bool:
         "POST", path, {"prepared_receipt": queued["prepared_receipt"]}, timeout=35,
         headers={"Idempotency-Key": queued["request_id"], "X-Broz-Continue": "1"},
     )
-    if str(result.get("deployment_id") or "") != str(queued["deployment_id"]) or result.get("status") not in {"activated", "accessible"}:
+    if str(result.get("deployment_id") or "") != str(queued["deployment_id"]) or result.get("status") not in {"activated", "accessible", "superseded"}:
         raise BrozError("Membership activation reconciliation is not complete", code="activation_reconciling")
     with contextlib.suppress(FileNotFoundError):
         project.reconcile_path.unlink()
     return True
 
 
-def wait_page(project: Project, deployment_id: str, timeout: float = 120.0, stop: threading.Event | None = None, lane: int = 0) -> int:
+def wait_page(project: Project, deployment_id: str, timeout: float = 120.0, stop: threading.Event | None = None, lane: int = 0, metrics: dict | None = None) -> int:
     started = monotonic_ms()
     hostname = str(project.state.get("primary_hostname") or project.state.get("hostname"))
     scheme = os.environ.get("BROZ_PUBLIC_SCHEME", "https")
@@ -817,6 +835,8 @@ def wait_page(project: Project, deployment_id: str, timeout: float = 120.0, stop
     connection_key = (parsed.scheme, parsed.netloc, lane)
     deadline = time.monotonic() + timeout
     last_status, last_header, last_body = 0, "", b""
+    if metrics is not None:
+        metrics.update({"lane": lane, "attempts": 0, "transport_errors": 0, "connection_reused": connection_key in project.public_connections})
     while time.monotonic() < deadline and not (stop and stop.is_set()):
         connection = project.public_connections.get(connection_key)
         if connection is None:
@@ -827,16 +847,32 @@ def wait_page(project: Project, deployment_id: str, timeout: float = 120.0, stop
             project.public_connections[connection_key] = connection
         path = f"/?mim_deployment={urllib.parse.quote(deployment_id)}&broz={secrets.token_hex(4)}"
         try:
+            if metrics is not None:
+                metrics["attempts"] += 1
             connection.request("GET", path, headers={"Cache-Control": "no-cache", "User-Agent": "broz-deploy/1.0", "Accept-Encoding": "identity"})
             response = connection.getresponse()
             last_status, last_header = response.status, response.getheader("X-Mim-Deployment", "")
-            last_body = response.read(4 << 20)
+            if metrics is not None and "first_response_ms" not in metrics:
+                metrics["first_response_ms"] = monotonic_ms() - started
+            if metrics is not None:
+                metrics["last_http_status"] = last_status
+                metrics["header_matched"] = last_header == deployment_id
+            try:
+                last_body = read_complete_page(response)
+            except BrozError:
+                project.public_connections.pop(connection_key, None)
+                connection.close()
+                raise
             if response.will_close:
                 project.public_connections.pop(connection_key, None)
                 connection.close()
             if last_status == 200 and last_header == deployment_id:
+                if metrics is not None:
+                    metrics["success_ms"] = monotonic_ms() - started
                 return monotonic_ms() - started
         except (http.client.HTTPException, TimeoutError, OSError):
+            if metrics is not None:
+                metrics["transport_errors"] += 1
             project.public_connections.pop(connection_key, None)
             with contextlib.suppress(OSError):
                 connection.close()
@@ -870,7 +906,7 @@ def warm_public_connections(project: Project) -> None:
             path = f"/?broz_warm={lane}&nonce={secrets.token_hex(4)}"
             connection.request("GET", path, headers={"Cache-Control": "no-cache", "User-Agent": "broz-deploy/1.0", "Accept-Encoding": "identity"})
             response = connection.getresponse()
-            response.read(4 << 20)
+            read_complete_page(response)
             if response.will_close:
                 connection.close()
                 return
@@ -908,6 +944,21 @@ def warm_membership_connections(project: Project) -> None:
         lane.start()
     for lane in lanes:
         lane.join(timeout=7)
+
+
+def warm_deploy_connections(project: Project, cache: dict) -> None:
+    """Warm independent fallback, public-read and node-activate paths together."""
+    groups = (
+        ("membership", lambda: warm_membership_connections(project)),
+        ("public", lambda: warm_public_connections(project)),
+        ("node", lambda: warm_node_activation_connection(project, cache)),
+    )
+    threads = [threading.Thread(target=operation, name=f"broz-warm-{name}", daemon=True)
+               for name, operation in groups]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=7)
 
 
 def race_activation(project: Project, path: str, body: dict, request_id: str, on_started, continue_existing: bool = False) -> tuple[dict, int, int]:
@@ -965,7 +1016,9 @@ def hot_deploy(project: Project, fallback: str, allow_direct: bool = False) -> d
             frozen = {"manifest_digest": cached.get("manifest_digest")}
         else:
             with tempfile.TemporaryDirectory(prefix="broz-freeze-") as directory:
-                frozen = prepare_snapshot(project, Path(directory))
+                # Freeze and hash every byte, but do not duplicate the bytes
+                # into upload staging unless the exact manifest is missing.
+                frozen = prepare_snapshot(project, Path(directory), materialize=False)
         snapshot_ms = monotonic_ms() - snapshot_started
         residual_started = monotonic_ms()
         prepare_cache_hit = cached.get("manifest_digest") == frozen["manifest_digest"] and bool(cached.get("prepared_receipt"))
@@ -1004,6 +1057,7 @@ def hot_deploy(project: Project, fallback: str, allow_direct: bool = False) -> d
 
             def verify_public_page() -> None:
                 outcomes: queue.Queue[tuple[str, object]] = queue.Queue()
+                lane_metrics: list[dict] = [{} for _ in public_lane_delays(project)]
 
                 def verify_lane(lane: int, delay: float) -> None:
                     try:
@@ -1013,9 +1067,10 @@ def hot_deploy(project: Project, fallback: str, allow_direct: bool = False) -> d
                             if page_stop.wait(delay):
                                 raise BrozError("public page verification cancelled")
                             delayed_ms = monotonic_ms() - delay_started
-                        outcomes.put(("ok", delayed_ms + wait_page(project, deployment, stop=page_stop, lane=lane)))
+                        elapsed = delayed_ms + wait_page(project, deployment, stop=page_stop, lane=lane, metrics=lane_metrics[lane])
+                        outcomes.put(("ok", (lane, elapsed)))
                     except BrozError as exc:
-                        outcomes.put(("error", exc))
+                        outcomes.put(("error", (lane, exc)))
 
                 lanes = [threading.Thread(target=verify_lane, args=(lane, delay), name=f"broz-public-page-{lane}", daemon=True) for lane, delay in enumerate(public_lane_delays(project))]
                 for lane_thread in lanes:
@@ -1024,10 +1079,13 @@ def hot_deploy(project: Project, fallback: str, allow_direct: bool = False) -> d
                 for _ in lanes:
                     outcome, value = outcomes.get()
                     if outcome == "ok":
-                        page_result["ms"] = value
+                        winning_lane, elapsed = value
+                        page_result["ms"] = elapsed
+                        page_result["winning_lane"] = winning_lane
+                        page_result["lanes"] = lane_metrics
                         page_stop.set()
                         break
-                    errors.append(value)
+                    errors.append(value[1])
                 if "ms" not in page_result:
                     page_result["error"] = errors[-1]
 
@@ -1131,7 +1189,7 @@ def hot_deploy(project: Project, fallback: str, allow_direct: bool = False) -> d
         total_ms = monotonic_ms() - started
         prepare_summary = {key: cached.get(key) for key in ("prepared_at", "prepare_metrics_ms", "snapshot_ms", "upload_ms", "prepare_api_ms")}
         prepare_summary["cache_hit"] = prepare_cache_hit
-        return {"ok": True, "mode": "hot", "activation_transport": activation_transport, "membership_reconcile": "queued" if activation_transport == "node_direct" else "committed", "activation_status": result.get("status"), "service_id": service_id, "revision_id": revision, "deployment_id": result["deployment_id"], "public_url": public_url, "prepare": prepare_summary, "activation_metrics_ms": result.get("metrics_ms", {}), "timings": {"snapshot_ms": snapshot_ms, "residual_prepare_ms": residual_ms, "deployment_id_ready_ms": 0, "activation_response_first_ms": begin_ms, "activate_begin_api_ms": begin_ms, "activate_complete_api_ms": complete_ms, "activate_api_ms": activate_ms, "page_ready_ms": monotonic_ms() - page_started, "public_fetch_ms": page_ms, "total_ms": total_ms, "within_1s": total_ms < 1000}}
+        return {"ok": True, "mode": "hot", "activation_transport": activation_transport, "membership_reconcile": "queued" if activation_transport == "node_direct" else "committed", "activation_status": result.get("status"), "service_id": service_id, "revision_id": revision, "deployment_id": result["deployment_id"], "public_url": public_url, "prepare": prepare_summary, "activation_metrics_ms": result.get("metrics_ms", {}), "public_verification": {"winning_lane": page_result.get("winning_lane"), "lanes": page_result.get("lanes", [])}, "timings": {"snapshot_ms": snapshot_ms, "residual_prepare_ms": residual_ms, "deployment_id_ready_ms": 0, "activation_response_first_ms": begin_ms, "activate_begin_api_ms": begin_ms, "activate_complete_api_ms": complete_ms, "activate_api_ms": activate_ms, "page_ready_ms": monotonic_ms() - page_started, "public_fetch_ms": page_ms, "total_ms": total_ms, "within_1s": total_ms < 1000}}
 
 
 def worker_reply(connection: socket.socket, value: dict) -> None:
@@ -1141,6 +1199,32 @@ def worker_reply(connection: socket.socket, value: dict) -> None:
     # prepare worker and discard its warmed connections.
     with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
         connection.sendall(encoded)
+
+
+def recv_worker_request(connection: socket.socket, limit: int = 64 << 10) -> dict:
+    """Read one bounded newline-delimited command from a Unix stream."""
+    data = bytearray()
+    while len(data) <= limit and not data.endswith(b"\n"):
+        chunk = connection.recv(min(16 << 10, limit + 1 - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+    if not data.endswith(b"\n") or len(data) > limit:
+        raise BrozError("invalid worker command", code="invalid_worker_command")
+    try:
+        value = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise BrozError("invalid worker command", code="invalid_worker_command") from exc
+    if not isinstance(value, dict):
+        raise BrozError("invalid worker command", code="invalid_worker_command")
+    return value
+
+
+def watcher_accept_timeout(now: float, next_scan: float) -> float:
+    """Sleep until the next scan while allowing a deploy socket to wake us."""
+    if next_scan <= now:
+        return 0.001
+    return max(0.001, min(0.25, next_scan - now))
 
 
 def stop_background_worker(project: Project) -> bool:
@@ -1200,7 +1284,7 @@ def worker_request(project: Project, fallback: str) -> dict | None:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(185)
             client.connect(str(project.socket_path))
-            client.sendall(json.dumps({"command": "deploy", "fallback": fallback}).encode() + b"\n")
+            client.sendall(json.dumps({"command": "deploy", "fallback": fallback, "sent_monotonic_ms": monotonic_ms()}).encode() + b"\n")
             response = bytearray()
             while len(response) <= 8 << 20 and not response.endswith(b"\n"):
                 chunk = client.recv(64 << 10)
@@ -1223,13 +1307,14 @@ def watch(project: Project) -> None:
     server.bind(str(project.socket_path))
     os.chmod(project.socket_path, 0o600)
     server.listen(4)
-    server.settimeout(0.02)
     last, changed_at = "", 0.0
     next_scan = 0.0
     next_reconcile = 0.0
     reconcile_thread: threading.Thread | None = None
+    slot_confirmed = False
     try:
         while True:
+            server.settimeout(watcher_accept_timeout(time.monotonic(), next_scan))
             try:
                 connection, _ = server.accept()
             except socket.timeout:
@@ -1238,13 +1323,19 @@ def watch(project: Project) -> None:
                 with connection:
                     connection.settimeout(2)
                     try:
-                        request = json.loads(connection.recv(64 << 10))
+                        request = recv_worker_request(connection)
                         if request.get("command") == "shutdown":
                             worker_reply(connection, {"ok": True, "stopped": True})
                             return
                         if request.get("command") != "deploy":
                             raise BrozError("unsupported worker command")
+                        received_at = monotonic_ms()
                         result = hot_deploy(project, str(request.get("fallback") or "cold"), allow_direct=True)
+                        try:
+                            sent_at = int(request.get("sent_monotonic_ms") or received_at)
+                        except (TypeError, ValueError):
+                            sent_at = received_at
+                        result.setdefault("timings", {})["worker_dispatch_ms"] = max(0, received_at - sent_at)
                         worker_reply(connection, result)
                     except BrozError as exc:
                         worker_reply(connection, {"ok": False, "error": str(exc), "code": exc.code})
@@ -1270,10 +1361,13 @@ def watch(project: Project) -> None:
                     last, changed_at = signature, now
                 if changed_at and now - changed_at >= 0.25:
                     with project.lock():
-                        result = ensure_prepared(project, persist=False)
-                    warm_membership_connections(project)
-                    warm_public_connections(project)
-                    warm_node_activation_connection(project, result)
+                        # A watcher may be restarted after `broz stop` while a
+                        # still-unexpired receipt and ticket remain on disk.
+                        # Confirm the live slot incarnation once per watcher
+                        # lifetime before trusting that cache.
+                        result = ensure_prepared(project, force_slot_check=not slot_confirmed, persist=False)
+                    slot_confirmed = True
+                    warm_deploy_connections(project, result)
                     if not result.get("cache_hit") and project.active_deployment_id:
                         with contextlib.suppress(BrozError):
                             wait_page(project, project.active_deployment_id, timeout=3)

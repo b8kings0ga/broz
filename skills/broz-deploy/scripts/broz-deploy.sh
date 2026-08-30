@@ -30,7 +30,7 @@ if [ "${BROZ_FORCE_LEGACY:-0}" != 1 ] && [ "${1:-}" = deploy ] && [ "$#" -ge 2 ]
 		if [ "$fast_mode" = 600 ]; then
 			fast_started="$(perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'printf "%.0f",clock_gettime(CLOCK_MONOTONIC)*1000')"
 			set +e
-			fast_response="$(perl -MIO::Socket::UNIX -MSocket -MJSON::PP -e 'my $s=IO::Socket::UNIX->new(Type=>SOCK_STREAM,Peer=>$ARGV[0]) or exit 42; $SIG{ALRM}=sub{die "timeout\n"}; alarm 190; print $s encode_json({command=>"deploy",fallback=>$ARGV[1]}),"\n"; shutdown($s,1); local $/; print <$s>; alarm 0' "$fast_socket" "$fast_fallback")"
+			fast_response="$(perl -MIO::Socket::UNIX -MSocket -MJSON::PP -e 'my $s=IO::Socket::UNIX->new(Type=>SOCK_STREAM,Peer=>$ARGV[0]) or exit 42; $SIG{ALRM}=sub{die "timeout\n"}; alarm 190; print $s encode_json({command=>"deploy",fallback=>$ARGV[1],sent_monotonic_ms=>0+$ARGV[2]}),"\n"; shutdown($s,1); local $/; print <$s>; alarm 0' "$fast_socket" "$fast_fallback" "$fast_started")"
 			fast_status=$?
 			set -e
 			if [ "$fast_status" -eq 42 ]; then

@@ -39,6 +39,7 @@ printf '// revision two\nBun.serve({port:Number(process.env.PORT)})\n' >"$TMP/ho
 hot="$($SCRIPT deploy "$TMP/hot-project" --profile mock --no-open)"
 jq -e '.ok and .mode=="hot" and .service_id=="svc_test" and .revision_id and .deployment_id and (.prepare.cache_hit == false) and (.timings.total_ms >= 0) and (.timings.within_1s == (.timings.total_ms < 1000))' <<<"$hot" >/dev/null
 [ "$(stat -f '%Lp' "$TMP/home/.cache/broz/projects/"*.json 2>/dev/null || stat -c '%a' "$TMP/home/.cache/broz/projects/"*.json)" = 600 ]
+fast_mode_before="$(curl -fsS "http://127.0.0.1:$PORT/__test/state" | jq -er '.fast_mode_calls')"
 watching="$($SCRIPT prepare "$TMP/hot-project" --profile mock --watch --no-open)"
 WATCH_PID="$(jq -er '.pid' <<<"$watching")"
 socket_path="$(jq -er '.socket_path' "$TMP/home/.cache/broz/workers/"*.json)"
@@ -49,8 +50,14 @@ for _ in $(seq 1 100); do
   grep -q '"event": "prepared"' "$TMP/home/.cache/broz/logs/"*.log 2>/dev/null && break
   sleep .02
 done
+for _ in $(seq 1 100); do
+  fast_mode_after="$(curl -fsS "http://127.0.0.1:$PORT/__test/state" | jq -er '.fast_mode_calls')"
+  [ "$fast_mode_after" -gt "$fast_mode_before" ] && break
+  sleep .02
+done
+[ "$fast_mode_after" -gt "$fast_mode_before" ]
 worker_hot="$($SCRIPT deploy "$TMP/hot-project" --profile mock --no-open)"
-jq -e '.ok and (.worker | startswith("persistent")) and .activation_transport=="node_direct" and .membership_reconcile=="queued" and (.prepare.cache_hit == true) and (.timings.command_total_ms >= .timings.total_ms)' <<<"$worker_hot" >/dev/null
+jq -e '.ok and (.worker | startswith("persistent")) and .activation_transport=="node_direct" and .membership_reconcile=="queued" and (.prepare.cache_hit == true) and (.timings.command_total_ms >= .timings.total_ms) and (.timings.worker_dispatch_ms >= 0)' <<<"$worker_hot" >/dev/null
 for _ in $(seq 1 150); do
   [ -z "$(find "$TMP/home/.cache/broz/reconcile" -type f -print -quit 2>/dev/null)" ] && break
   sleep .02

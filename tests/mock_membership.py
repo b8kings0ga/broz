@@ -3,7 +3,7 @@ import argparse, base64, hashlib, io, json, os, tarfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-state = {"services": {}, "deployments": 0, "revisions": 0, "blobs": {}, "activation_mismatch_once": True}
+state = {"services": {}, "deployments": 0, "revisions": 0, "blobs": {}, "activation_mismatch_once": True, "fast_mode_calls": 0}
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
@@ -63,6 +63,7 @@ class Handler(BaseHTTPRequestHandler):
             self.body(); state["services"]["svc_test"]["status"] = "stopped"; self.send_json(200, {"status": "stopped"}); return
         self.send_json(404, {"error": "not_found"})
     def do_GET(self):
+        if self.path == "/__test/state": self.send_json(200, {"fast_mode_calls": state["fast_mode_calls"]}); return
         if self.path == "/__mim/slot-healthz": self.send_json(200, {"ok": True, "slot_id": "slot_test"}); return
         if self.path == "/v1/services": self.send_json(200, {"items": list(state["services"].values())}); return
         if self.path == "/v1/services/svc_test" and "svc_test" in state["services"]: self.send_json(200, state["services"]["svc_test"]); return
@@ -75,7 +76,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not_found"})
     def do_PUT(self):
         if self.path.endswith("/fast-mode"):
-            self.body(); self.send_json(200, {"enabled": True, "billing": "running_per_minute", "slot": {"id": "slot_test", "state": "ready"}}); return
+            self.body(); state["fast_mode_calls"] += 1; self.send_json(200, {"enabled": True, "billing": "running_per_minute", "slot": {"id": "slot_test", "state": "ready"}}); return
         if "/blobs/" in self.path:
             state["blobs"][self.path.rsplit("/", 1)[-1]] = self.body(); self.send_json(201, {"stored": True}); return
         self.send_json(404, {"error": "not_found"})
