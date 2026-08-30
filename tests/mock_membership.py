@@ -44,7 +44,7 @@ class Handler(BaseHTTPRequestHandler):
             deployment = "dep_" + base64.urlsafe_b64encode(hashlib.sha256(identity).digest()[:18]).decode().rstrip("=")
             state["deployments"] += 1
             service = state["services"]["svc_test"]; service.update(status="running", active_deployment_id=deployment)
-            self.send_json(200, {"status": "accessible", "mode": "hot", "service_id": "svc_test", "revision_id": revision, "deployment_id": deployment, "public_url": "http://"+service["hostname"], "metrics_ms": {"child_spawn": 2}}); return
+            self.send_json(200, {"status": "activated", "mode": "hot", "service_id": "svc_test", "revision_id": revision, "deployment_id": deployment, "public_url": "http://"+service["hostname"], "expected_deployment_header": deployment, "metrics_ms": {"child_spawn": 2}}); return
         if self.path.endswith("/deploy"):
             self.body(); state["deployments"] += 1; deployment = "dep_%d" % state["deployments"]
             service = state["services"]["svc_test"]; service.update(status="running", active_deployment_id=deployment)

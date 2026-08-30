@@ -201,7 +201,11 @@ class API:
             response.read()
             if response.will_close:
                 self.close_connection(key)
-            if final.get("status") != "accessible":
+            # During a rolling control-plane upgrade older Membership nodes may
+            # still return "accessible". New nodes stop at the authoritative
+            # slot transition and return "activated"; this client performs the
+            # only public-page verification below.
+            if final.get("status") not in {"activated", "accessible"}:
                 if final.get("status") in {"activating", "activation_running", "public_verifying", "reconciling"}:
                     raise BrozError(f"hot activation is {final.get('status')}", code="activation_reconciling")
                 raise BrozError(f"hot activation is {final.get('status', 'unknown')}", int(final.get("http_status") or 0), str(final.get("error") or "hot_activation_failed"))
@@ -231,7 +235,7 @@ class API:
                 if deployment:
                     on_started(result)
                 last_status = str(result.get("status") or "unknown")
-                if last_status == "accessible":
+                if last_status in {"activated", "accessible"}:
                     return result
                 if last_status == "cold_fallback":
                     raise BrozError("hot activation failed before switching", code="hot_activation_failed_cold_fallback_allowed")
@@ -916,14 +920,17 @@ def hot_deploy(project: Project, fallback: str) -> dict:
         page_thread.join(timeout=120)
         if page_thread.is_alive():
             page_stop.set()
-            raise BrozError("public page verification did not finish")
+            raise BrozError("slot activated, but public page verification did not finish", code="public_verification_failed_after_activation")
         if "error" in page_result:
-            raise page_result["error"]
+            raise BrozError(
+                f"slot activated, but public page verification failed: {page_result['error']}",
+                code="public_verification_failed_after_activation",
+            ) from page_result["error"]
         page_ms = int(page_result["ms"])
         project.active_deployment_id = str(result["deployment_id"])
         public_url = str(result.get("public_url") or ("https://" + str(project.state.get("primary_hostname") or project.state.get("hostname") or "")))
         if public_url == "https://":
-            raise BrozError("accessible activation omitted the public hostname", code="activation_reconciling")
+            raise BrozError("activated response omitted the public hostname", code="activation_reconciling")
         total_ms = monotonic_ms() - started
         return {"ok": True, "mode": "hot", "service_id": service_id, "revision_id": revision, "deployment_id": result["deployment_id"], "public_url": public_url, "prepare": {key: cached.get(key) for key in ("prepared_at", "prepare_metrics_ms", "snapshot_ms", "upload_ms", "prepare_api_ms", "cache_hit")}, "activation_metrics_ms": result.get("metrics_ms", {}), "timings": {"snapshot_ms": snapshot_ms, "residual_prepare_ms": residual_ms, "deployment_id_ready_ms": 0, "activation_response_first_ms": begin_ms, "activate_begin_api_ms": begin_ms, "activate_complete_api_ms": complete_ms, "activate_api_ms": activate_ms, "page_ready_ms": monotonic_ms() - page_started, "public_fetch_ms": page_ms, "total_ms": total_ms, "within_1s": total_ms < 1000}}
 

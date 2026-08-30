@@ -20,7 +20,7 @@ class FakeAPI:
     def activate_stream(self, path, body, request_id, on_started):
         self.calls.append(self.name)
         time.sleep(self.delay)
-        deployment = {"deployment_id": "dep_exact", "status": "accessible"}
+        deployment = {"deployment_id": "dep_exact", "status": "activated"}
         on_started(deployment)
         return deployment
 
