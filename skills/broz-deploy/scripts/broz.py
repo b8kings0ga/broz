@@ -928,11 +928,14 @@ def hot_deploy(project: Project, fallback: str) -> dict:
             ) from page_result["error"]
         page_ms = int(page_result["ms"])
         project.active_deployment_id = str(result["deployment_id"])
+        expected_header = str(result.get("expected_deployment_header") or result["deployment_id"])
+        if expected_header != result["deployment_id"]:
+            raise BrozError("activated response changed the expected public identity", code="activation_reconciling")
         public_url = str(result.get("public_url") or ("https://" + str(project.state.get("primary_hostname") or project.state.get("hostname") or "")))
         if public_url == "https://":
             raise BrozError("activated response omitted the public hostname", code="activation_reconciling")
         total_ms = monotonic_ms() - started
-        return {"ok": True, "mode": "hot", "service_id": service_id, "revision_id": revision, "deployment_id": result["deployment_id"], "public_url": public_url, "prepare": {key: cached.get(key) for key in ("prepared_at", "prepare_metrics_ms", "snapshot_ms", "upload_ms", "prepare_api_ms", "cache_hit")}, "activation_metrics_ms": result.get("metrics_ms", {}), "timings": {"snapshot_ms": snapshot_ms, "residual_prepare_ms": residual_ms, "deployment_id_ready_ms": 0, "activation_response_first_ms": begin_ms, "activate_begin_api_ms": begin_ms, "activate_complete_api_ms": complete_ms, "activate_api_ms": activate_ms, "page_ready_ms": monotonic_ms() - page_started, "public_fetch_ms": page_ms, "total_ms": total_ms, "within_1s": total_ms < 1000}}
+        return {"ok": True, "mode": "hot", "activation_status": result.get("status"), "service_id": service_id, "revision_id": revision, "deployment_id": result["deployment_id"], "public_url": public_url, "prepare": {key: cached.get(key) for key in ("prepared_at", "prepare_metrics_ms", "snapshot_ms", "upload_ms", "prepare_api_ms", "cache_hit")}, "activation_metrics_ms": result.get("metrics_ms", {}), "timings": {"snapshot_ms": snapshot_ms, "residual_prepare_ms": residual_ms, "deployment_id_ready_ms": 0, "activation_response_first_ms": begin_ms, "activate_begin_api_ms": begin_ms, "activate_complete_api_ms": complete_ms, "activate_api_ms": activate_ms, "page_ready_ms": monotonic_ms() - page_started, "public_fetch_ms": page_ms, "total_ms": total_ms, "within_1s": total_ms < 1000}}
 
 
 def worker_reply(connection: socket.socket, value: dict) -> None:

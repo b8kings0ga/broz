@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import importlib.util
+import contextlib
 import threading
 import time
 import unittest
@@ -50,6 +51,46 @@ class ActivationHedgeTests(unittest.TestCase):
         result, _, _ = broz.race_activation(project, "/activate", {}, "key", lambda _: None)
         self.assertEqual(result["deployment_id"], "dep_exact")
         self.assertEqual(calls[:2], ["primary", "hedge"])
+
+
+class PublicVerificationBoundaryTests(unittest.TestCase):
+    def test_failure_after_activation_never_cold_falls_back(self):
+        original = {name: getattr(broz, name) for name in (
+            "load_json", "prepare_snapshot", "fast_deployment_id", "race_activation",
+            "public_lane_delays", "wait_page", "cold_deploy",
+        )}
+        cold_calls = []
+        try:
+            broz.load_json = lambda *_args, **_kwargs: {
+                "manifest_digest": "manifest", "prepared_receipt": "receipt",
+                "service_id": "svc", "revision_id": "rev",
+            }
+            broz.prepare_snapshot = lambda *_args, **_kwargs: {"manifest_digest": "manifest"}
+            broz.fast_deployment_id = lambda *_args: "dep_exact"
+
+            def activate(_project, _path, _body, _request_id, on_started):
+                result = {
+                    "status": "activated", "deployment_id": "dep_exact",
+                    "expected_deployment_header": "dep_exact", "public_url": "https://example.invalid",
+                }
+                on_started(result)
+                return result, 1, 2
+
+            broz.race_activation = activate
+            broz.public_lane_delays = lambda _project: (0.0,)
+            broz.wait_page = lambda *_args, **_kwargs: (_ for _ in ()).throw(broz.BrozError("public mismatch"))
+            broz.cold_deploy = lambda *_args, **_kwargs: cold_calls.append(True)
+            project = type("Project", (), {
+                "runtime": "bun", "cache_path": Path("unused"), "user_id": "user",
+                "state": {}, "active_deployment_id": "", "lock": lambda self: contextlib.nullcontext(),
+            })()
+            with self.assertRaises(broz.BrozError) as raised:
+                broz.hot_deploy(project, "cold")
+            self.assertEqual(raised.exception.code, "public_verification_failed_after_activation")
+            self.assertEqual(cold_calls, [])
+        finally:
+            for name, value in original.items():
+                setattr(broz, name, value)
 
 
 if __name__ == "__main__":
