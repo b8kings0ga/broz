@@ -37,7 +37,7 @@ prepared="$($SCRIPT prepare "$TMP/hot-project" --profile mock --domain mock-hot 
 jq -e '.ok and .state=="prepared" and .service_id=="svc_test" and .revision_id' <<<"$prepared" >/dev/null
 printf '// revision two\nBun.serve({port:Number(process.env.PORT)})\n' >"$TMP/hot-project/server.js"
 hot="$($SCRIPT deploy "$TMP/hot-project" --profile mock --no-open)"
-jq -e '.ok and .mode=="hot" and .service_id=="svc_test" and .revision_id and .deployment_id and (.timings.total_ms >= 0) and (.timings.within_1s == (.timings.total_ms < 1000))' <<<"$hot" >/dev/null
+jq -e '.ok and .mode=="hot" and .service_id=="svc_test" and .revision_id and .deployment_id and (.prepare.cache_hit == false) and (.timings.total_ms >= 0) and (.timings.within_1s == (.timings.total_ms < 1000))' <<<"$hot" >/dev/null
 [ "$(stat -f '%Lp' "$TMP/home/.cache/broz/projects/"*.json 2>/dev/null || stat -c '%a' "$TMP/home/.cache/broz/projects/"*.json)" = 600 ]
 watching="$($SCRIPT prepare "$TMP/hot-project" --profile mock --watch --no-open)"
 WATCH_PID="$(jq -er '.pid' <<<"$watching")"
@@ -50,7 +50,7 @@ for _ in $(seq 1 100); do
   sleep .02
 done
 worker_hot="$($SCRIPT deploy "$TMP/hot-project" --profile mock --no-open)"
-jq -e '.ok and (.worker | startswith("persistent")) and (.timings.command_total_ms >= .timings.total_ms)' <<<"$worker_hot" >/dev/null
+jq -e '.ok and (.worker | startswith("persistent")) and (.prepare.cache_hit == true) and (.timings.command_total_ms >= .timings.total_ms)' <<<"$worker_hot" >/dev/null
 kill -TERM "$WATCH_PID"
 for _ in $(seq 1 100); do kill -0 "$WATCH_PID" 2>/dev/null || break; sleep .02; done
 [ -S "$socket_path" ]

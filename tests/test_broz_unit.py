@@ -93,5 +93,29 @@ class PublicVerificationBoundaryTests(unittest.TestCase):
                 setattr(broz, name, value)
 
 
+class PrepareRetryTests(unittest.TestCase):
+    def test_runtime_bridge_convergence_stays_in_one_prepare_attempt(self):
+        original_sleep = broz.time.sleep
+        failures = []
+        calls = 0
+
+        def operation():
+            nonlocal calls
+            calls += 1
+            if calls < 4:
+                error = broz.BrozError("warming", status=503, code="membership_runtime_unavailable")
+                failures.append(error)
+                raise error
+            return "prepared"
+
+        try:
+            broz.time.sleep = lambda _delay: None
+            self.assertEqual(broz.retry_fast_prepare("upload", operation), "prepared")
+        finally:
+            broz.time.sleep = original_sleep
+        self.assertEqual(calls, 4)
+        self.assertTrue(all(error.stage == "upload" for error in failures))
+
+
 if __name__ == "__main__":
     unittest.main()

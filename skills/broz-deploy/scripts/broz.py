@@ -44,13 +44,28 @@ SECRET_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
 
 
 class BrozError(RuntimeError):
-    def __init__(self, message: str, status: int = 0, code: str = ""):
+    def __init__(self, message: str, status: int = 0, code: str = "", stage: str = ""):
         super().__init__(message)
-        self.status, self.code = status, code
+        self.status, self.code, self.stage = status, code, stage
 
 
 def monotonic_ms() -> int:
     return time.monotonic_ns() // 1_000_000
+
+
+def retry_fast_prepare(stage: str, operation):
+    """Absorb a short runtime-bridge convergence window inside one prepare."""
+    transient = {"fast_deploy_unavailable", "membership_runtime_unavailable"}
+    for attempt in range(8):
+        try:
+            return operation()
+        except BrozError as exc:
+            if not exc.stage:
+                exc.stage = stage
+            if exc.code not in transient or attempt == 7:
+                raise
+            time.sleep(min(0.05 * (2 ** attempt), 0.4))
+    raise AssertionError("unreachable")
 
 
 def fast_deployment_id(user_id: str, service_id: str, revision_id: str, request_id: str) -> str:
@@ -610,7 +625,7 @@ def ensure_prepared(project: Project, force_slot_check: bool = False, force_repr
             slot = {"id": cached["slot_id"], "incarnation_id": cached["slot_incarnation_id"], "generation": cached["slot_generation"], "state": "ready"}
             service = {"id": cached["service_id"], "hostname": cached.get("hostname") or project.state.get("hostname"), "_slot": slot}
         else:
-            service = ensure_service_and_slot(project, temporary)
+            service = retry_fast_prepare("service_slot", lambda: ensure_service_and_slot(project, temporary))
             slot = service["_slot"]
         slot_matches = cached.get("slot_id") == slot.get("id") and cached.get("slot_incarnation_id") == slot.get("incarnation_id") and cached.get("slot_generation") == slot.get("generation")
         if not force_reprepare and cached.get("manifest_digest") == snapshot["manifest_digest"] and cached.get("prepared_receipt") and slot_matches:
@@ -623,13 +638,13 @@ def ensure_prepared(project: Project, force_slot_check: bool = False, force_repr
         request = {key: snapshot[key] for key in ("runtime", "arch", "manifest_digest", "dependency_digest")}
         request["blobs"] = [{key: value for key, value in blob.items() if key != "_local"} for blob in snapshot["blobs"]]
         try:
-            declared, _, _ = project.api.request("POST", f"/v1/services/{service['id']}/revisions", request)
+            declared, _, _ = retry_fast_prepare("declare", lambda: project.api.request("POST", f"/v1/services/{service['id']}/revisions", request))
         except BrozError as exc:
             if exc.code != "slot_not_ready":
                 raise
-            service = ensure_service_and_slot(project, temporary)
+            service = retry_fast_prepare("service_slot", lambda: ensure_service_and_slot(project, temporary))
             slot = service["_slot"]
-            declared, _, _ = project.api.request("POST", f"/v1/services/{service['id']}/revisions", request)
+            declared, _, _ = retry_fast_prepare("declare", lambda: project.api.request("POST", f"/v1/services/{service['id']}/revisions", request))
         revision = declared["revision_id"]
         local_by_digest = {blob["transport_sha256"].removeprefix("sha256:"): blob for blob in snapshot["blobs"]}
         upload_started = monotonic_ms()
@@ -642,17 +657,16 @@ def ensure_prepared(project: Project, force_slot_check: bool = False, force_repr
             # the longer budget required by their intentionally asynchronous
             # compressed upload path.
             upload_timeout = 120 if len(payload) > (1 << 20) else 15
-            for attempt in range(3):
-                try:
-                    project.api.request("PUT", target["upload_url"], data=payload, headers={"Content-Type": "application/octet-stream"}, timeout=upload_timeout)
-                    break
-                except BrozError as exc:
-                    if attempt == 2 or exc.code not in {"fast_deploy_unavailable", "membership_runtime_unavailable"}:
-                        raise
-                    time.sleep(0.05 * (attempt + 1))
+            retry_fast_prepare(
+                "upload",
+                lambda: project.api.request("PUT", target["upload_url"], data=payload, headers={"Content-Type": "application/octet-stream"}, timeout=upload_timeout),
+            )
         upload_ms = monotonic_ms() - upload_started
         prepare_started = monotonic_ms()
-        prepared, _, _ = project.api.request("POST", f"/v1/services/{service['id']}/revisions/{revision}/prepare", {})
+        prepared, _, _ = retry_fast_prepare(
+            "prepare",
+            lambda: project.api.request("POST", f"/v1/services/{service['id']}/revisions/{revision}/prepare", {}),
+        )
         prepare_ms = monotonic_ms() - prepare_started
         slot = prepared.get("slot") or slot
         cache = {"project_id": project.project_id, "service_id": service["id"], "hostname": service["hostname"], "runtime": project.runtime, "arch": project.arch, "slot_id": slot.get("id", ""), "slot_incarnation_id": slot.get("incarnation_id", ""), "slot_generation": slot.get("generation", 0), "manifest_digest": snapshot["manifest_digest"], "content_snapshot_digest": snapshot["content_snapshot_digest"], "dependency_digest": snapshot["dependency_digest"], "revision_id": revision, "prepared_receipt": prepared["prepared_receipt"], "prepared_at": prepared.get("prepared_at", ""), "prepare_metrics_ms": prepared.get("metrics_ms", {}), "snapshot_ms": snapshot_ms, "upload_ms": upload_ms, "prepare_api_ms": prepare_ms, "cache_hit": False}
@@ -815,8 +829,10 @@ def hot_deploy(project: Project, fallback: str) -> dict:
                 frozen = prepare_snapshot(project, Path(directory))
         snapshot_ms = monotonic_ms() - snapshot_started
         residual_started = monotonic_ms()
-        if cached.get("manifest_digest") != frozen["manifest_digest"] or not cached.get("prepared_receipt"):
+        prepare_cache_hit = cached.get("manifest_digest") == frozen["manifest_digest"] and bool(cached.get("prepared_receipt"))
+        if not prepare_cache_hit:
             cached = ensure_prepared(project)
+            prepare_cache_hit = bool(cached.get("cache_hit"))
         residual_ms = monotonic_ms() - residual_started
         service_id, revision = cached["service_id"], cached["revision_id"]
         request_id = "broz_" + secrets.token_urlsafe(24).replace("-", "_")
@@ -935,7 +951,9 @@ def hot_deploy(project: Project, fallback: str) -> dict:
         if public_url == "https://":
             raise BrozError("activated response omitted the public hostname", code="activation_reconciling")
         total_ms = monotonic_ms() - started
-        return {"ok": True, "mode": "hot", "activation_status": result.get("status"), "service_id": service_id, "revision_id": revision, "deployment_id": result["deployment_id"], "public_url": public_url, "prepare": {key: cached.get(key) for key in ("prepared_at", "prepare_metrics_ms", "snapshot_ms", "upload_ms", "prepare_api_ms", "cache_hit")}, "activation_metrics_ms": result.get("metrics_ms", {}), "timings": {"snapshot_ms": snapshot_ms, "residual_prepare_ms": residual_ms, "deployment_id_ready_ms": 0, "activation_response_first_ms": begin_ms, "activate_begin_api_ms": begin_ms, "activate_complete_api_ms": complete_ms, "activate_api_ms": activate_ms, "page_ready_ms": monotonic_ms() - page_started, "public_fetch_ms": page_ms, "total_ms": total_ms, "within_1s": total_ms < 1000}}
+        prepare_summary = {key: cached.get(key) for key in ("prepared_at", "prepare_metrics_ms", "snapshot_ms", "upload_ms", "prepare_api_ms")}
+        prepare_summary["cache_hit"] = prepare_cache_hit
+        return {"ok": True, "mode": "hot", "activation_status": result.get("status"), "service_id": service_id, "revision_id": revision, "deployment_id": result["deployment_id"], "public_url": public_url, "prepare": prepare_summary, "activation_metrics_ms": result.get("metrics_ms", {}), "timings": {"snapshot_ms": snapshot_ms, "residual_prepare_ms": residual_ms, "deployment_id_ready_ms": 0, "activation_response_first_ms": begin_ms, "activate_begin_api_ms": begin_ms, "activate_complete_api_ms": complete_ms, "activate_api_ms": activate_ms, "page_ready_ms": monotonic_ms() - page_started, "public_fetch_ms": page_ms, "total_ms": total_ms, "within_1s": total_ms < 1000}}
 
 
 def worker_reply(connection: socket.socket, value: dict) -> None:
@@ -1076,12 +1094,12 @@ def watch(project: Project) -> None:
                     # worker's remaining preparation work.
                     if not result.get("cache_hit"):
                         atomic_json(project.cache_path, {key: value for key, value in result.items() if key != "cache_hit"}, 0o600)
-                    print(json.dumps({"event": "prepared", "revision_id": result["revision_id"], "manifest_digest": result["manifest_digest"]}), flush=True)
+                    print(json.dumps({"event": "prepared", "at_unix_ms": time.time_ns() // 1_000_000, "revision_id": result["revision_id"], "manifest_digest": result["manifest_digest"]}), flush=True)
                     changed_at = 0.0
             except Exception as exc:  # fixed fields only; never print credentials or request headers
-                failure = {"event": "prepare_failed", "error": type(exc).__name__}
+                failure = {"event": "prepare_failed", "at_unix_ms": time.time_ns() // 1_000_000, "error": type(exc).__name__}
                 if isinstance(exc, BrozError):
-                    failure.update({"code": exc.code or "unknown", "http_status": exc.status})
+                    failure.update({"stage": exc.stage or "unknown", "code": exc.code or "unknown", "http_status": exc.status})
                 print(json.dumps(failure), flush=True)
                 # An unchanged latest snapshot must recover from a transient
                 # Membership/slot failure without requiring another file edit.
